@@ -1,0 +1,23 @@
+{
+  "name": "cloud-file-explorer",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run build && bun run --watch server/index.ts",
+    "build": "bun run build.ts",
+    "start": "bun server/index.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "hono": "^4.4.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "fuse.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "tailwindcss": "^3.4.0"
+  }
+}
