@@ -1621,6 +1621,7 @@ function DeviceSwitcher({
   onSelectCombo,
   onToggleUnified,
   onOpenManager,
+  onRefreshDevices,
   onToast,
 }: {
   devices: Device[];
@@ -1632,18 +1633,28 @@ function DeviceSwitcher({
   onSelectCombo: (id: string) => void;
   onToggleUnified: () => void;
   onOpenManager: () => void;
+  onRefreshDevices: () => void;
   onToast: (msg: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [health, setHealth] = useState<Record<string, string>>({});
+  const [addMode, setAddMode] = useState<false | "detect" | "manual" | "detected">(false);
+  const [localProbe, setLocalProbe] = useState<{ name: string; icon: string; hostname: string; port: number; ips: string[] } | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [addUrl, setAddUrl] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState("");
+  const [copied, setCopied] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const urlRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) { setOpen(false); setAddMode(false); } };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
+  // Health check remotes when opening
   useEffect(() => {
     if (open) {
       devices.filter((d) => !d.isLocal).forEach(async (d) => {
@@ -1655,6 +1666,128 @@ function DeviceSwitcher({
     }
   }, [open]);
 
+  // When "Add This Machine" clicked, probe localhost to see if file-explorer is running
+  const probeLocalMachine = async () => {
+    setAddMode("detect");
+    setProbing(true);
+    setLocalProbe(null);
+    setAddError("");
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      const res = await fetch("http://localhost:3456/api/whoami", { signal: controller.signal }).finally(() => clearTimeout(timeout));
+      if (res.ok) {
+        const data = await res.json();
+        setLocalProbe(data);
+        setAddMode("detected");
+      } else {
+        setAddMode("manual");
+      }
+    } catch {
+      setAddMode("manual");
+    }
+    setProbing(false);
+  };
+
+  // Register detected local machine with the hub
+  const registerDetected = async () => {
+    if (!localProbe) return;
+    setAdding(true);
+    setAddError("");
+
+    // Figure out best URL the hub can reach
+    // If we're accessing the hub via tailscale hostname, use the local machine's hostname too
+    const hubHost = window.location.hostname;
+    let deviceUrl = "";
+
+    // Try: same hostname pattern — if hub is at bens-mac-mini.taild3a34a.ts.net,
+    // try the local machine's hostname with same tailscale domain
+    if (hubHost.includes(".ts.net")) {
+      const tsDomain = hubHost.substring(hubHost.indexOf("."));
+      deviceUrl = `http://${localProbe.hostname}${tsDomain}:${localProbe.port}`;
+    } else {
+      // Use first non-internal IP
+      const ip = localProbe.ips[0] || "localhost";
+      deviceUrl = `http://${ip}:${localProbe.port}`;
+    }
+
+    try {
+      const res = await devicesApi.add({ name: localProbe.name, url: deviceUrl, icon: localProbe.icon || "💻" });
+      if (res.success) {
+        onToast(`Added: ${res.device?.name}`);
+        setAddMode(false);
+        onRefreshDevices();
+      } else if (res.error?.includes("already exists")) {
+        onToast("Already connected!");
+        setAddMode(false);
+      } else {
+        // If tailscale URL failed, try with IP
+        if (deviceUrl.includes(".ts.net") && localProbe.ips[0]) {
+          const fallbackUrl = `http://${localProbe.ips[0]}:${localProbe.port}`;
+          const res2 = await devicesApi.add({ name: localProbe.name, url: fallbackUrl, icon: localProbe.icon || "💻" });
+          if (res2.success) {
+            onToast(`Added: ${res2.device?.name}`);
+            setAddMode(false);
+            onRefreshDevices();
+          } else {
+            setAddError(res2.error || "Hub can't reach this machine. Try entering the URL manually.");
+            setAddMode("manual");
+            setAddUrl(fallbackUrl);
+          }
+        } else {
+          setAddError(res.error || "Hub can't reach this machine");
+          setAddMode("manual");
+          setAddUrl(deviceUrl);
+        }
+      }
+    } catch (err: any) {
+      setAddError(err.message || "Failed");
+      setAddMode("manual");
+    }
+    setAdding(false);
+  };
+
+  // Manual URL add
+  const handleManualAdd = async () => {
+    const url = addUrl.trim().replace(/\/+$/, "");
+    if (!url) return;
+    setAdding(true);
+    setAddError("");
+    try {
+      // Try to get name from remote whoami
+      let name = "";
+      let icon = "🖥️";
+      try {
+        const probe = await fetch(`${url}/api/whoami`, { signal: AbortSignal.timeout(3000) });
+        if (probe.ok) {
+          const data = await probe.json();
+          name = data.name || data.hostname || "";
+          icon = data.icon || "🖥️";
+        }
+      } catch { /* fall through */ }
+      if (!name) {
+        try { name = new URL(url).hostname.replace(/\./g, "-").replace(/^-|-$/g, ""); } catch { name = "device"; }
+      }
+      const res = await devicesApi.add({ name, url, icon });
+      if (res.success) {
+        onToast(`Connected: ${res.device?.name}`);
+        setAddUrl(""); setAddMode(false);
+        onRefreshDevices();
+      } else {
+        setAddError(res.error || "Failed to connect");
+      }
+    } catch {
+      setAddError("Invalid URL");
+    }
+    setAdding(false);
+  };
+
+  const copyCommand = () => {
+    navigator.clipboard.writeText("cd ~/repos/file-explorer && bun server/index.ts");
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
   const active = devices.find((d) => d.id === activeId) || devices[0];
   const activeCombo = combos.find((c) => c.id === activeComboId);
 
@@ -1664,7 +1797,7 @@ function DeviceSwitcher({
   return (
     <div ref={ref} className="relative">
       <button
-        onClick={() => setOpen(!open)}
+        onClick={() => { setOpen(!open); setAddMode(false); setAddError(""); }}
         className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl hover:bg-sand-100 dark:hover:bg-ink-800 text-ink-700 dark:text-ink-300 transition-all text-sm font-medium"
       >
         <span className="text-base leading-none">{displayIcon}</span>
@@ -1675,16 +1808,13 @@ function DeviceSwitcher({
       </button>
 
       {open && (
-        <div className="absolute top-full left-0 mt-1.5 w-72 bg-white dark:bg-ink-900 rounded-xl shadow-xl border border-sand-200 dark:border-ink-800 overflow-hidden z-50 animate-slide-up">
+        <div className="absolute top-full left-0 mt-1.5 w-80 bg-white dark:bg-ink-900 rounded-xl shadow-xl border border-sand-200 dark:border-ink-800 overflow-hidden z-50 animate-slide-up">
           {/* Devices */}
           <div className="p-1.5">
-            <div className="px-3 pt-1 pb-1.5">
-              <span className="text-[10px] font-semibold uppercase tracking-widest text-sand-400 dark:text-ink-600">Devices</span>
-            </div>
             {devices.filter((d) => d.isLocal || d.enabled).map((d) => (
               <button
                 key={d.id}
-                onClick={() => { onSelect(d.id); setOpen(false); }}
+                onClick={() => { onSelect(d.id); setOpen(false); setAddMode(false); }}
                 className={`group flex items-center gap-2.5 w-full px-3 py-2 rounded-lg text-left text-sm transition-colors ${
                   !unifiedMode && !activeComboId && d.id === activeId
                     ? "bg-sand-100 dark:bg-ink-800 text-ink-900 dark:text-ink-100 font-medium"
@@ -1698,19 +1828,15 @@ function DeviceSwitcher({
                     {Icons.signal}
                   </span>
                 )}
-                {d.isLocal && <span className="text-[10px] text-sand-400 dark:text-ink-600 bg-sand-100 dark:bg-ink-800 px-1.5 py-0.5 rounded">local</span>}
+                {d.isLocal && <span className="text-[10px] text-sand-400 dark:text-ink-600 bg-sand-100 dark:bg-ink-800 px-1.5 py-0.5 rounded">hub</span>}
                 {!unifiedMode && !activeComboId && d.id === activeId && <span className="text-sky-500">{Icons.check}</span>}
               </button>
             ))}
           </div>
 
-          {/* Views (combos + All Devices) */}
+          {/* Views (combos + All Devices) — only if there are multiple devices */}
           {(devices.length > 1 || combos.length > 0) && (
             <div className="border-t border-sand-100 dark:border-ink-800 p-1.5">
-              <div className="px-3 pt-1 pb-1.5">
-                <span className="text-[10px] font-semibold uppercase tracking-widest text-sand-400 dark:text-ink-600">Views</span>
-              </div>
-              {/* Custom combos */}
               {combos.map((combo) => (
                 <button
                   key={combo.id}
@@ -1723,11 +1849,10 @@ function DeviceSwitcher({
                 >
                   <span className="text-base leading-none">{combo.icon}</span>
                   <span className="flex-1 truncate">{combo.name}</span>
-                  <span className="text-[10px] text-sand-400 dark:text-ink-600">{combo.deviceIds.length} devices</span>
+                  <span className="text-[10px] text-sand-400 dark:text-ink-600">{combo.deviceIds.length}</span>
                   {activeComboId === combo.id && <span className="text-sky-500">{Icons.check}</span>}
                 </button>
               ))}
-              {/* All Devices */}
               {devices.length > 1 && (
                 <button
                   onClick={() => { onToggleUnified(); setOpen(false); }}
@@ -1745,16 +1870,111 @@ function DeviceSwitcher({
             </div>
           )}
 
-          {/* Manage */}
-          <div className="border-t border-sand-100 dark:border-ink-800 p-1.5">
-            <button
-              onClick={() => { onOpenManager(); setOpen(false); }}
-              className="flex items-center gap-2.5 w-full px-3 py-2 rounded-lg text-left text-sm text-ink-500 dark:text-ink-400 hover:bg-sand-50 dark:hover:bg-ink-800/50 transition-colors"
-            >
-              <span className="text-sand-400 dark:text-ink-500">{Icons.settings}</span>
-              <span>Manage Devices…</span>
-            </button>
+          {/* Add Machine — the main CTA */}
+          <div className="border-t border-sand-100 dark:border-ink-800 p-2">
+            {!addMode && (
+              <button
+                onClick={probeLocalMachine}
+                className="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-lg text-sm font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 hover:bg-ink-800 dark:hover:bg-white transition-colors"
+              >
+                {Icons.plus}
+                Add This Machine
+              </button>
+            )}
+
+            {/* Detecting... */}
+            {addMode === "detect" && probing && (
+              <div className="flex items-center justify-center gap-2 py-3">
+                <div className="w-4 h-4 border-2 border-sand-200 dark:border-ink-700 border-t-sand-500 dark:border-t-ink-400 rounded-full animate-spin" />
+                <span className="text-xs text-sand-500 dark:text-ink-400">Checking for file-explorer on this machine…</span>
+              </div>
+            )}
+
+            {/* Detected! One-click add */}
+            {addMode === "detected" && localProbe && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800">
+                  <span className="text-lg">{localProbe.icon || "💻"}</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-emerald-800 dark:text-emerald-300">{localProbe.name}</div>
+                    <div className="text-[10px] text-emerald-600 dark:text-emerald-500 font-mono">Found running on port {localProbe.port}</div>
+                  </div>
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                </div>
+                <button
+                  onClick={registerDetected}
+                  disabled={adding}
+                  className="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-lg text-sm font-semibold text-white dark:text-ink-900 bg-emerald-600 dark:bg-emerald-500 hover:bg-emerald-700 dark:hover:bg-emerald-400 transition-colors disabled:opacity-50"
+                >
+                  {adding ? "Connecting…" : "Connect This Machine"}
+                </button>
+                {addError && <p className="text-xs text-red-500 dark:text-red-400 px-1">{addError}</p>}
+              </div>
+            )}
+
+            {/* Not found — show setup instructions + manual URL */}
+            {addMode === "manual" && (
+              <div className="space-y-2.5">
+                <div className="px-2 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800">
+                  <div className="text-xs font-medium text-amber-800 dark:text-amber-300 mb-1.5">Not running on this machine</div>
+                  <div className="text-[11px] text-amber-700 dark:text-amber-400 leading-relaxed mb-2">
+                    Start file-explorer on the machine you want to add:
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <code className="flex-1 px-2 py-1.5 bg-amber-100 dark:bg-amber-900/40 rounded text-[10px] font-mono text-amber-900 dark:text-amber-200 truncate">
+                      bun server/index.ts
+                    </code>
+                    <button
+                      onClick={copyCommand}
+                      className="px-2 py-1.5 text-[10px] font-medium bg-amber-200 dark:bg-amber-800 text-amber-800 dark:text-amber-200 rounded hover:bg-amber-300 dark:hover:bg-amber-700 transition-colors"
+                    >
+                      {copied ? "Copied!" : "Copy"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="text-[10px] font-semibold text-sand-400 dark:text-ink-600 uppercase tracking-widest px-1">Or paste a URL</div>
+                <div className="flex gap-1.5">
+                  <input
+                    ref={urlRef}
+                    value={addUrl}
+                    onChange={(e) => { setAddUrl(e.target.value); setAddError(""); }}
+                    onKeyDown={(e) => { if (e.key === "Enter") handleManualAdd(); if (e.key === "Escape") { setOpen(false); setAddMode(false); } }}
+                    placeholder="http://192.168.1.50:3456"
+                    className="flex-1 min-w-0 bg-sand-50 dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-lg px-2.5 py-2 text-xs font-mono text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-600 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
+                    autoFocus
+                  />
+                  <button
+                    onClick={handleManualAdd}
+                    disabled={adding || !addUrl.trim()}
+                    className="px-3 py-2 text-xs font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 rounded-lg hover:bg-ink-800 dark:hover:bg-white transition-colors disabled:opacity-30"
+                  >
+                    {adding ? "…" : "Add"}
+                  </button>
+                </div>
+                {addError && <p className="text-xs text-red-500 dark:text-red-400 px-1">{addError}</p>}
+                <button
+                  onClick={() => { setAddMode(false); setAddError(""); }}
+                  className="w-full text-xs text-sand-400 dark:text-ink-500 hover:text-ink-600 dark:hover:text-ink-300 py-1 transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
           </div>
+
+          {/* Footer: manage link */}
+          {devices.length > 1 && !addMode && (
+            <div className="border-t border-sand-100 dark:border-ink-800 p-1.5">
+              <button
+                onClick={() => { onOpenManager(); setOpen(false); }}
+                className="flex items-center gap-2.5 w-full px-3 py-1.5 rounded-lg text-left text-xs text-sand-400 dark:text-ink-500 hover:text-ink-600 dark:hover:text-ink-300 hover:bg-sand-50 dark:hover:bg-ink-800/50 transition-colors"
+              >
+                {Icons.settings}
+                <span>Manage Devices & Views…</span>
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -2166,6 +2386,7 @@ function App() {
                 onSelectCombo={(id) => { setActiveComboId(id); setUnifiedMode(false); }}
                 onToggleUnified={() => { setUnifiedMode((u) => !u); setActiveComboId(null); }}
                 onOpenManager={() => setDeviceManagerOpen(true)}
+                onRefreshDevices={loadDevices}
                 onToast={showToast}
               />
             )}

@@ -92,6 +92,29 @@ function getLocalIcon(): string {
   return settings.localIcon || "💻";
 }
 
+// ─── Identity ────────────────────────────────────────────────────────────────
+// Returns this machine's identity so remote instances can register it
+
+app.get("/api/whoami", (c) => {
+  const os = require("os");
+  const hostname = os.hostname().replace(/\.local$/, "");
+  const interfaces = os.networkInterfaces();
+  const ips: string[] = [];
+  for (const iface of Object.values(interfaces) as any[]) {
+    if (!iface) continue;
+    for (const addr of iface) {
+      if (addr.family === "IPv4" && !addr.internal) ips.push(addr.address);
+    }
+  }
+  return c.json({
+    hostname,
+    name: getLocalName(),
+    icon: getLocalIcon(),
+    port: parseInt(process.env.PORT || "3456"),
+    ips,
+  });
+});
+
 // ─── Device Management API ───────────────────────────────────────────────────
 
 // List all devices (including "local")

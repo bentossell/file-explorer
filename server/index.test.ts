@@ -616,3 +616,17 @@ describe("GET /api/download", () => {
     expect(res.status).toBe(400);
   });
 });
+
+// ─── Whoami ──────────────────────────────────────────────────────────────────
+
+describe("GET /api/whoami", () => {
+  test("returns machine identity", async () => {
+    const res = await fetch(`${BASE}/api/whoami`);
+    const data = await res.json();
+    expect(data.hostname).toBeDefined();
+    expect(typeof data.hostname).toBe("string");
+    expect(data.name).toBeDefined();
+    expect(data.port).toBe(PORT);
+    expect(Array.isArray(data.ips)).toBe(true);
+  });
+});
