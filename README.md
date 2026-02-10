@@ -3,6 +3,8 @@
 Self-hosted multi-machine file browser.
 built with [droid](https://factory.ai)
 
+Give this repo url to your agent and ask it to set it up :)
+
 ![File Explorer](screenshot.png)
 
 ## Model
@@ -17,7 +19,7 @@ built with [droid](https://factory.ai)
 ### 1. Install + run
 
 ```bash
-git clone https://github.com/<your-org-or-user>/file-explorer.git
+git clone https://github.com/bentossell/file-explorer.git
 cd file-explorer
 bun install
 bun run build
