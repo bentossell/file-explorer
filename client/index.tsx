@@ -387,7 +387,7 @@ const API_TOKEN_STORAGE_KEY = "file_explorer_api_token";
 
 let inMemoryApiToken = (() => {
   if (typeof window === "undefined") return "";
-  return localStorage.getItem(API_TOKEN_STORAGE_KEY) || "";
+  return sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || "";
 })();
 
 function getApiToken(): string {
@@ -397,8 +397,8 @@ function getApiToken(): string {
 function setApiToken(token: string) {
   inMemoryApiToken = token.trim();
   if (typeof window !== "undefined") {
-    if (inMemoryApiToken) localStorage.setItem(API_TOKEN_STORAGE_KEY, inMemoryApiToken);
-    else localStorage.removeItem(API_TOKEN_STORAGE_KEY);
+    if (inMemoryApiToken) sessionStorage.setItem(API_TOKEN_STORAGE_KEY, inMemoryApiToken);
+    else sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
   }
 }
 
@@ -411,15 +411,6 @@ function withAuthHeaders(headers?: HeadersInit): Headers {
   const token = getApiToken();
   if (token) merged.set("Authorization", `Bearer ${token}`);
   return merged;
-}
-
-function withAuthQuery(url: string): string {
-  const token = getApiToken();
-  if (!token) return url;
-  const base = typeof window !== "undefined" ? window.location.origin : "http://localhost";
-  const parsed = new URL(url, base);
-  parsed.searchParams.set("token", token);
-  return `${parsed.pathname}${parsed.search}`;
 }
 
 async function apiFetch(input: string, init: RequestInit = {}): Promise<Response> {
@@ -492,8 +483,8 @@ function createApi(deviceId: string) {
       const res = await apiFetch(`${base}/info?path=${encodeURIComponent(path)}`);
       return readJson(res);
     },
-    getDownloadUrl(path: string): string {
-      return withAuthQuery(`${base}/download?path=${encodeURIComponent(path)}`);
+    async download(path: string): Promise<Response> {
+      return apiFetch(`${base}/download?path=${encodeURIComponent(path)}`);
     },
     async mkdir(dirPath: string): Promise<{ success?: boolean; error?: string }> {
       const res = await apiFetch(`${base}/mkdir`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: dirPath }) });
@@ -1148,7 +1139,7 @@ function FavouritesSection({
 }: {
   favourites: Favourite[];
   onFileClick: (fav: Favourite) => void;
-  onNavigate: (path: string) => void;
+  onNavigate: (path: string, deviceId?: string) => void;
   onRemove: (path: string, deviceId?: string) => void;
 }) {
   if (favourites.length === 0) return null;
@@ -1163,7 +1154,7 @@ function FavouritesSection({
         {favourites.map((fav) => (
           <div
             key={`${fav.deviceId || "local"}:${fav.path}`}
-            onClick={() => fav.isDirectory ? onNavigate(fav.path) : onFileClick(fav)}
+            onClick={() => fav.isDirectory ? onNavigate(fav.path, fav.deviceId) : onFileClick(fav)}
             className="group relative flex flex-col items-center p-3.5 rounded-2xl bg-white/60 dark:bg-ink-900/50 hover:bg-white dark:hover:bg-ink-800 border border-sand-100 dark:border-ink-800/50 hover:border-sand-200 dark:hover:border-ink-700 hover:shadow-sm transition-all duration-150 cursor-pointer"
           >
             <button
@@ -1224,6 +1215,7 @@ function PreviewPanel({ file, onClose, isFav, onToggleFav, onToast, onRefresh, a
   const [preview, setPreview] = useState<PreviewData | null>(null);
   const [info, setInfo] = useState<FileInfo | null>(null);
   const [loading, setLoading] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editContent, setEditContent] = useState("");
@@ -1266,6 +1258,39 @@ function PreviewPanel({ file, onClose, isFav, onToggleFav, onToast, onRefresh, a
       onRefresh();
     } else {
       onToast(res.error || "Failed to save");
+    }
+  };
+
+  const handleDownload = async () => {
+    if (!file) return;
+    setDownloading(true);
+    try {
+      const res = await api.download(file.path);
+      if (!res.ok) {
+        let message = `Failed to download (${res.status})`;
+        try {
+          const data = await res.json();
+          if (data && typeof data.error === "string" && data.error) message = data.error;
+        } catch { /* response may not be json */ }
+        onToast(message);
+        return;
+      }
+      const blob = await res.blob();
+      const contentDisposition = res.headers.get("content-disposition") || "";
+      const filenameMatch = contentDisposition.match(/filename=\"?([^\";]+)\"?/i);
+      const filename = filenameMatch?.[1] || file.name;
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(blobUrl);
+    } catch {
+      onToast("Failed to download");
+    } finally {
+      setDownloading(false);
     }
   };
 
@@ -1392,14 +1417,14 @@ function PreviewPanel({ file, onClose, isFav, onToggleFav, onToast, onRefresh, a
       {/* Actions */}
       {!editing && (
         <div className="px-5 py-4 border-t border-sand-100 dark:border-ink-800 flex gap-2">
-          <a
-            href={api.getDownloadUrl(file.path)}
-            download
+          <button
+            onClick={handleDownload}
+            disabled={downloading}
             className="flex-1 flex items-center justify-center gap-2 bg-ink-900 dark:bg-ink-100 text-white dark:text-ink-900 text-sm font-semibold py-2.5 rounded-xl hover:bg-ink-800 dark:hover:bg-white transition-colors"
           >
             {Icons.download}
-            Download
-          </a>
+            {downloading ? "Downloading…" : "Download"}
+          </button>
           <button
             onClick={copyPath}
             className="flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium bg-sand-100 dark:bg-ink-800 text-ink-700 dark:text-ink-300 rounded-xl hover:bg-sand-200 dark:hover:bg-ink-700 transition-colors"
@@ -2404,13 +2429,14 @@ function App() {
       } else {
         const data = await api.getFiles(dirPath, hidden ?? showHidden);
         const activeDevice = devices.find((d) => d.id === activeDeviceId);
-        const tagFiles = cameFromUnified && activeDevice;
-        setFiles(tagFiles ? data.files.map((f) => ({
+        setFiles(data.files.map((f) => ({
           ...f,
           deviceId: activeDeviceId,
-          deviceName: activeDevice.name,
-          deviceIcon: activeDevice.icon || "💻",
-        })) : data.files);
+          ...(cameFromUnified && activeDevice ? {
+            deviceName: activeDevice.name,
+            deviceIcon: activeDevice.icon || "💻",
+          } : {}),
+        })));
         setBreadcrumbs(data.breadcrumbs);
         setCurrentPath(dirPath);
       }
@@ -2573,7 +2599,14 @@ function App() {
   };
 
   const handleRecentClick = (file: RecentFile) => {
-    setSelectedFile({ name: file.name, path: file.path, isDirectory: false, icon: file.type, size: file.size });
+    setSelectedFile({
+      name: file.name,
+      path: file.path,
+      isDirectory: false,
+      icon: file.type,
+      size: file.size,
+      deviceId: activeDeviceId,
+    });
   };
 
   // ── File operations ──
@@ -2689,6 +2722,33 @@ function App() {
       onSelect: () => { setActiveDeviceId(d.id); setUnifiedMode(false); setActiveComboId(null); },
     })),
   ];
+
+  const visibleFavourites = React.useMemo(() => {
+    const showMultiDeviceFavs = !cameFromUnified && (unifiedMode || Boolean(activeComboId));
+    const includeMachineTag = showMultiDeviceFavs;
+
+    const withDeviceMeta = favs.favourites.map((fav) => {
+      const deviceId = fav.deviceId || "local";
+      const device = devices.find((d) => d.id === deviceId);
+      const deviceName = fav.deviceName || device?.name;
+      const deviceIcon = fav.deviceIcon || device?.icon;
+      return {
+        ...fav,
+        deviceId,
+        deviceName: includeMachineTag ? deviceName : undefined,
+        deviceIcon: includeMachineTag ? deviceIcon : undefined,
+      };
+    });
+
+    if (showMultiDeviceFavs) {
+      if (!activeComboId) return withDeviceMeta;
+      const combo = combos.find((c) => c.id === activeComboId);
+      const allowed = new Set(combo?.deviceIds || []);
+      return withDeviceMeta.filter((fav) => allowed.has(fav.deviceId || "local"));
+    }
+
+    return withDeviceMeta.filter((fav) => (fav.deviceId || "local") === activeDeviceId);
+  }, [favs.favourites, devices, combos, activeDeviceId, unifiedMode, activeComboId, cameFromUnified]);
 
   const fileCount = files.filter((f) => !f.isDirectory).length;
   const folderCount = files.filter((f) => f.isDirectory).length;
@@ -2827,8 +2887,17 @@ function App() {
             )}
             {currentPath === "" && (
               <FavouritesSection
-                favourites={favs.favourites}
-                onFileClick={(fav) => setSelectedFile({ name: fav.name, path: fav.path, isDirectory: fav.isDirectory, icon: fav.icon, size: 0 })}
+                favourites={visibleFavourites}
+                onFileClick={(fav) => setSelectedFile({
+                  name: fav.name,
+                  path: fav.path,
+                  isDirectory: fav.isDirectory,
+                  icon: fav.icon,
+                  size: 0,
+                  deviceId: fav.deviceId,
+                  deviceName: fav.deviceName,
+                  deviceIcon: fav.deviceIcon,
+                })}
                 onNavigate={handleNavigate}
                 onRemove={(path, deviceId) => favs.remove(path, deviceId)}
               />

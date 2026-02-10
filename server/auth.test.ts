@@ -110,10 +110,8 @@ describe("token enforcement", () => {
     expect(res.status).toBe(200);
   });
 
-  test("accepts token query param (download)", async () => {
+  test("rejects token query param (download)", async () => {
     const res = await fetch(`${BASE}/api/download?path=auth-file.txt&token=${READ_TOKEN}`);
-    expect(res.status).toBe(200);
-    const text = await res.text();
-    expect(text).toBe("ok");
+    expect(res.status).toBe(401);
   });
 });

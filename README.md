@@ -111,12 +111,16 @@ Env vars:
 - `FILE_EXPLORER_ADMIN_TOKEN`: full read/write.
 - `FILE_EXPLORER_READ_TOKEN`: read-only.
 - `FILE_EXPLORER_API_TOKEN`: legacy alias for admin token.
+- `FILE_EXPLORER_ALLOW_NO_AUTH=true`: disable auth (local/dev only; off by default).
+- `FILE_EXPLORER_CORS_ORIGINS=https://app.example.com,https://admin.example.com`: optional CORS allowlist (disabled by default).
 
 Behavior:
 
+- Auth is required by default.
 - Auth prompt appears in client when enabled.
 - Write APIs require admin token.
 - Read token can browse/search/preview/download.
+- Tokens are accepted via `Authorization: Bearer ...` (or `X-File-Explorer-Token`), not query params.
 
 ## Troubleshooting
 

@@ -37,7 +37,7 @@ beforeAll(async () => {
   // Start the server with test sandbox as root
   proc = Bun.spawn(["bun", "server/index.ts"], {
     cwd: path.join(import.meta.dir, ".."),
-    env: { ...process.env, PORT: String(PORT), FILE_EXPLORER_ROOT: SANDBOX },
+    env: { ...process.env, PORT: String(PORT), FILE_EXPLORER_ROOT: SANDBOX, FILE_EXPLORER_ALLOW_NO_AUTH: "true" },
     stdout: "ignore",
     stderr: "ignore",
   });
@@ -139,6 +139,19 @@ describe("GET /api/files", () => {
   test("rejects directory traversal", async () => {
     const res = await fetch(`${BASE}/api/files?path=../../etc`);
     expect(res.status).toBe(400);
+  });
+
+  test("rejects sibling-prefix traversal outside root", async () => {
+    const siblingName = `${path.basename(SANDBOX)}-sibling`;
+    const siblingPath = path.join(path.dirname(SANDBOX), siblingName);
+    fs.mkdirSync(siblingPath, { recursive: true });
+    try {
+      fs.writeFileSync(path.join(siblingPath, "secret.txt"), "secret", "utf-8");
+      const res = await fetch(`${BASE}/api/files?path=${encodeURIComponent(`../${siblingName}`)}`);
+      expect(res.status).toBe(400);
+    } finally {
+      if (fs.existsSync(siblingPath)) fs.rmSync(siblingPath, { recursive: true, force: true });
+    }
   });
 
   test("returns file type icons correctly", async () => {
@@ -524,6 +537,21 @@ describe("GET /api/preview", () => {
   test("rejects traversal", async () => {
     const res = await fetch(`${BASE}/api/preview?path=../../etc/passwd`);
     expect(res.status).toBe(400);
+  });
+
+  test("rejects symlink escape outside root", async () => {
+    const outsidePath = path.join(path.dirname(SANDBOX), `${path.basename(SANDBOX)}-outside`);
+    const symlinkPath = path.join(SANDBOX, "outside-link");
+    fs.mkdirSync(outsidePath, { recursive: true });
+    fs.writeFileSync(path.join(outsidePath, "secret.txt"), "secret", "utf-8");
+    fs.symlinkSync(outsidePath, symlinkPath);
+    try {
+      const res = await fetch(`${BASE}/api/preview?path=outside-link/secret.txt`);
+      expect(res.status).toBe(400);
+    } finally {
+      if (fs.existsSync(symlinkPath)) fs.unlinkSync(symlinkPath);
+      if (fs.existsSync(outsidePath)) fs.rmSync(outsidePath, { recursive: true, force: true });
+    }
   });
 });
 

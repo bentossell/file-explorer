@@ -20,6 +20,14 @@ const MAX_RECENT = 50;
 
 // Root directory to browse (configurable via env)
 const ROOT_DIR = process.env.FILE_EXPLORER_ROOT || process.env.HOME || "/";
+const ROOT_DIR_ABS = path.resolve(ROOT_DIR);
+const ROOT_DIR_REAL = (() => {
+  try {
+    return fs.realpathSync(ROOT_DIR_ABS);
+  } catch {
+    return ROOT_DIR_ABS;
+  }
+})();
 
 // ─── Device Registry ─────────────────────────────────────────────────────────
 
@@ -57,7 +65,17 @@ const SETTINGS_FILE = path.join(DEVICES_DIR, "settings.json");
 const LEGACY_API_TOKEN = (process.env.FILE_EXPLORER_API_TOKEN || "").trim();
 const ADMIN_API_TOKEN = (process.env.FILE_EXPLORER_ADMIN_TOKEN || LEGACY_API_TOKEN).trim();
 const READ_API_TOKEN = (process.env.FILE_EXPLORER_READ_TOKEN || "").trim();
+const ALLOW_NO_AUTH = (process.env.FILE_EXPLORER_ALLOW_NO_AUTH || "").trim().toLowerCase() === "true";
 const AUTH_ENABLED = Boolean(ADMIN_API_TOKEN || READ_API_TOKEN);
+if (!AUTH_ENABLED && !ALLOW_NO_AUTH) {
+  throw new Error("Auth is required. Set FILE_EXPLORER_ADMIN_TOKEN (recommended) or FILE_EXPLORER_ALLOW_NO_AUTH=true for local-only mode.");
+}
+
+const CORS_ALLOWED_ORIGINS = (process.env.FILE_EXPLORER_CORS_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const CORS_ALLOW_ALL = CORS_ALLOWED_ORIGINS.includes("*");
 
 function loadDevices(): DeviceConfig[] {
   try {
@@ -107,9 +125,6 @@ function getTokenFromRequest(c: any): string | null {
   const customHeader = (c.req.header("x-file-explorer-token") || "").trim();
   if (customHeader) return customHeader;
 
-  const urlToken = (new URL(c.req.url).searchParams.get("token") || "").trim();
-  if (urlToken) return urlToken;
-
   return null;
 }
 
@@ -131,6 +146,18 @@ function getForwardAuthHeader(c: any, explicitToken?: string): string | null {
   return null;
 }
 
+if (CORS_ALLOWED_ORIGINS.length > 0) {
+  app.use("*", cors({
+    origin: (origin) => {
+      if (!origin) return null;
+      if (CORS_ALLOW_ALL || CORS_ALLOWED_ORIGINS.includes(origin)) return origin;
+      return null;
+    },
+    allowMethods: ["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowHeaders: ["Authorization", "Content-Type", "X-File-Explorer-Token"],
+  }));
+}
+
 // Get hostname for the local device name
 function getLocalName(): string {
   const settings = loadSettings();
@@ -149,6 +176,36 @@ function getLocalIcon(): string {
 // ─── SSH Helpers ─────────────────────────────────────────────────────────────
 
 import { spawn } from "child_process";
+
+class InvalidPathError extends Error {}
+
+function resolveSshRoot(rootDir: string): string {
+  return path.posix.resolve("/", rootDir || "/");
+}
+
+function isSshPathInsideRoot(rootDir: string, targetPath: string): boolean {
+  const relative = path.posix.relative(rootDir, targetPath);
+  return relative === "" || (!relative.startsWith("..") && !path.posix.isAbsolute(relative));
+}
+
+function resolveSafeSshPath(rootDir: string, requestedPath: string): string | null {
+  if (typeof requestedPath !== "string") return null;
+  const normalizedRoot = resolveSshRoot(rootDir);
+  const normalizedRequested = requestedPath.replace(/\\/g, "/");
+  const candidate = path.posix.resolve(normalizedRoot, normalizedRequested);
+  if (!isSshPathInsideRoot(normalizedRoot, candidate)) return null;
+  return candidate;
+}
+
+function toSshRelativePath(rootDir: string, absolutePath: string): string {
+  const normalizedRoot = resolveSshRoot(rootDir);
+  const relative = path.posix.relative(normalizedRoot, absolutePath);
+  return relative === "" ? "" : relative;
+}
+
+function buildSshWriteCommand(filePath: string, base64Content: string): string {
+  return `printf %s ${JSON.stringify(base64Content)} | { base64 --decode 2>/dev/null || base64 -d 2>/dev/null || base64 -D 2>/dev/null; } > ${JSON.stringify(filePath)}`;
+}
 
 function sshExec(host: string, command: string, timeoutMs = 15000): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
@@ -178,7 +235,9 @@ function sshExecBinary(host: string, command: string, timeoutMs = 30000): Promis
 
 // SSH-based file listing (mirrors /api/files response shape)
 async function sshListFiles(host: string, rootDir: string, requestedPath: string, showHidden: boolean) {
-  const targetDir = requestedPath ? `${rootDir}/${requestedPath}` : rootDir;
+  const targetDir = resolveSafeSshPath(rootDir, requestedPath);
+  if (!targetDir) throw new InvalidPathError("Invalid path");
+  const safeRequestedPath = toSshRelativePath(rootDir, targetDir);
   // Use a single ssh call that outputs JSON-ish data we can parse
   // stat format: type|name|size|mtime
   const hiddenFlag = showHidden ? "-a" : "";
@@ -194,7 +253,7 @@ async function sshListFiles(host: string, rootDir: string, requestedPath: string
     const isDir = type === "Directory" || type === "directory";
     const size = parseInt(sizeStr) || 0;
     const modified = new Date(parseInt(mtimeStr) * 1000).toISOString();
-    const relativePath = requestedPath ? `${requestedPath}/${name}` : name;
+    const relativePath = safeRequestedPath ? `${safeRequestedPath}/${name}` : name;
     return {
       name,
       path: relativePath,
@@ -210,14 +269,14 @@ async function sshListFiles(host: string, rootDir: string, requestedPath: string
   });
 
   const breadcrumbs: Array<{ name: string; path: string }> = [{ name: "Home", path: "" }];
-  if (requestedPath) {
-    const parts = requestedPath.split("/");
+  if (safeRequestedPath) {
+    const parts = safeRequestedPath.split("/");
     parts.forEach((name, i) => {
       breadcrumbs.push({ name, path: parts.slice(0, i + 1).join("/") });
     });
   }
 
-  return { path: requestedPath, breadcrumbs, files };
+  return { path: safeRequestedPath, breadcrumbs, files };
 }
 
 async function sshSearch(host: string, rootDir: string, searchPath: string, query: string) {
@@ -231,15 +290,18 @@ async function sshSearch(host: string, rootDir: string, searchPath: string, quer
     effectiveQuery = query.slice(lastSlash + 1) || "";
   }
 
-  const targetDir = effectivePath ? `${rootDir}/${effectivePath}` : rootDir;
+  const targetDir = resolveSafeSshPath(rootDir, effectivePath);
+  if (!targetDir) throw new InvalidPathError("Invalid path");
+  const normalizedRoot = resolveSshRoot(rootDir);
   const cmd = `find ${JSON.stringify(targetDir)} -maxdepth 5 -name '*' 2>/dev/null | head -500`;
   const { stdout } = await sshExec(host, cmd);
   const allPaths = stdout.trim().split("\n").filter(Boolean);
   const items = allPaths.map((fullPath) => {
-    const relativePath = fullPath.startsWith(rootDir) ? fullPath.slice(rootDir.length + 1) : fullPath;
-    const name = path.basename(fullPath);
+    const relativePath = path.posix.relative(normalizedRoot, fullPath);
+    if (!relativePath || relativePath.startsWith("..") || path.posix.isAbsolute(relativePath)) return null;
+    const name = path.posix.basename(fullPath);
     return { name, path: relativePath, isDirectory: false, icon: getFileType(name), size: 0 };
-  }).filter((f) => f.name && !f.name.startsWith("."));
+  }).filter((f): f is { name: string; path: string; isDirectory: boolean; icon: string; size: number } => Boolean(f && f.name && !f.name.startsWith(".")));
 
   if (query.includes("/") && !effectiveQuery) {
     return { results: items.slice(0, 50) };
@@ -250,9 +312,11 @@ async function sshSearch(host: string, rootDir: string, searchPath: string, quer
 }
 
 async function sshPreview(host: string, rootDir: string, filePath: string) {
-  const fullPath = `${rootDir}/${filePath}`;
-  const ext = path.extname(filePath).toLowerCase();
-  const fileType = getFileType(path.basename(filePath));
+  const fullPath = resolveSafeSshPath(rootDir, filePath);
+  if (!fullPath) throw new InvalidPathError("Invalid path");
+  const safeRelativePath = toSshRelativePath(rootDir, fullPath);
+  const ext = path.posix.extname(safeRelativePath).toLowerCase();
+  const fileType = getFileType(path.posix.basename(safeRelativePath));
 
   if (fileType === "image") {
     const { data, code } = await sshExecBinary(host, `cat ${JSON.stringify(fullPath)}`);
@@ -275,8 +339,10 @@ async function sshPreview(host: string, rootDir: string, filePath: string) {
 }
 
 async function sshFileInfo(host: string, rootDir: string, filePath: string) {
-  const fullPath = `${rootDir}/${filePath}`;
-  const name = path.basename(filePath);
+  const fullPath = resolveSafeSshPath(rootDir, filePath);
+  if (!fullPath) throw new InvalidPathError("Invalid path");
+  const safeRelativePath = toSshRelativePath(rootDir, fullPath);
+  const name = path.posix.basename(safeRelativePath);
   // Try macOS stat first, then Linux stat
   const cmd = `stat -f '%z|%B|%m|%a|%HT' ${JSON.stringify(fullPath)} 2>/dev/null || stat --format='%s|%W|%Y|%X|%F' ${JSON.stringify(fullPath)} 2>/dev/null`;
   const { stdout, code } = await sshExec(host, cmd);
@@ -284,7 +350,7 @@ async function sshFileInfo(host: string, rootDir: string, filePath: string) {
   const [sizeStr, createdStr, modifiedStr, accessedStr, type] = stdout.trim().split("|");
   const isDir = type === "Directory" || type === "directory";
   return {
-    name, path: filePath, isDirectory: isDir,
+    name, path: safeRelativePath, isDirectory: isDir,
     size: parseInt(sizeStr) || 0,
     created: new Date(parseInt(createdStr) * 1000).toISOString(),
     modified: new Date(parseInt(modifiedStr) * 1000).toISOString(),
@@ -295,7 +361,8 @@ async function sshFileInfo(host: string, rootDir: string, filePath: string) {
 }
 
 async function sshDownload(host: string, rootDir: string, filePath: string) {
-  const fullPath = `${rootDir}/${filePath}`;
+  const fullPath = resolveSafeSshPath(rootDir, filePath);
+  if (!fullPath) throw new InvalidPathError("Invalid path");
   const { data, code } = await sshExecBinary(host, `cat ${JSON.stringify(fullPath)}`);
   if (code !== 0) throw new Error("Failed to download");
   return data;
@@ -607,7 +674,7 @@ app.all("/api/d/:deviceId/*", async (c) => {
   // ─── SSH device ─────────────────────────────────────────────────────────
   if (device.sshHost) {
     const host = device.sshHost;
-    const root = device.sshRoot || "/";
+    const root = resolveSshRoot(device.sshRoot || "/");
     const suffix = c.req.path.replace(`/api/d/${deviceId}/`, "").split("?")[0];
     const url = new URL(c.req.url);
 
@@ -656,32 +723,37 @@ app.all("/api/d/:deviceId/*", async (c) => {
 
       if (suffix === "mkdir" && c.req.method === "POST") {
         const body = await c.req.json();
-        const dirPath = `${root}/${body.path}`;
+        const dirPath = resolveSafeSshPath(root, body.path || "");
+        if (!dirPath) return c.json({ error: "Invalid path" }, 400);
         const { code } = await sshExec(host, `mkdir -p ${JSON.stringify(dirPath)}`);
         return code === 0 ? c.json({ success: true }) : c.json({ error: "Failed to create folder" }, 500);
       }
 
       if (suffix === "touch" && c.req.method === "POST") {
         const body = await c.req.json();
-        const filePath = `${root}/${body.path}`;
-        const dir = path.dirname(filePath);
+        const filePath = resolveSafeSshPath(root, body.path || "");
+        if (!filePath) return c.json({ error: "Invalid path" }, 400);
+        const dir = path.posix.dirname(filePath);
         const content = body.content || "";
-        const cmd = `mkdir -p ${JSON.stringify(dir)} && cat > ${JSON.stringify(filePath)} << 'SSHEOF'\n${content}\nSSHEOF`;
+        const b64 = Buffer.from(String(content)).toString("base64");
+        const cmd = `mkdir -p ${JSON.stringify(dir)} && ${buildSshWriteCommand(filePath, b64)}`;
         const { code } = await sshExec(host, cmd);
         return code === 0 ? c.json({ success: true }) : c.json({ error: "Failed to create file" }, 500);
       }
 
       if (suffix === "rename" && c.req.method === "POST") {
         const body = await c.req.json();
-        const from = `${root}/${body.from}`;
-        const to = `${root}/${body.to}`;
+        const from = resolveSafeSshPath(root, body.from || "");
+        const to = resolveSafeSshPath(root, body.to || "");
+        if (!from || !to) return c.json({ error: "Invalid path" }, 400);
         const { code } = await sshExec(host, `mv ${JSON.stringify(from)} ${JSON.stringify(to)}`);
         return code === 0 ? c.json({ success: true }) : c.json({ error: "Failed to rename" }, 500);
       }
 
       if (suffix === "delete" && c.req.method === "POST") {
         const body = await c.req.json();
-        const targetPath = `${root}/${body.path}`;
+        const targetPath = resolveSafeSshPath(root, body.path || "");
+        if (!targetPath) return c.json({ error: "Invalid path" }, 400);
         // Safety: don't delete root
         if (targetPath === root) return c.json({ error: "Cannot delete root" }, 400);
         const { code } = await sshExec(host, `rm -rf ${JSON.stringify(targetPath)}`);
@@ -690,19 +762,21 @@ app.all("/api/d/:deviceId/*", async (c) => {
 
       if (suffix === "save" && c.req.method === "POST") {
         const body = await c.req.json();
-        const filePath = `${root}/${body.path}`;
+        const filePath = resolveSafeSshPath(root, body.path || "");
+        if (!filePath) return c.json({ error: "Invalid path" }, 400);
         // Use base64 to safely transfer content
-        const b64 = Buffer.from(body.content || "").toString("base64");
-        const { code } = await sshExec(host, `echo '${b64}' | base64 -d > ${JSON.stringify(filePath)}`);
+        const b64 = Buffer.from(String(body.content || "")).toString("base64");
+        const { code } = await sshExec(host, buildSshWriteCommand(filePath, b64));
         return code === 0 ? c.json({ success: true }) : c.json({ error: "Failed to save" }, 500);
       }
 
       if (suffix === "duplicate" && c.req.method === "POST") {
         const body = await c.req.json();
-        const src = `${root}/${body.path}`;
-        const ext = path.extname(src);
-        const base = path.basename(src, ext);
-        const dir = path.dirname(src);
+        const src = resolveSafeSshPath(root, body.path || "");
+        if (!src) return c.json({ error: "Invalid path" }, 400);
+        const ext = path.posix.extname(src);
+        const base = path.posix.basename(src, ext);
+        const dir = path.posix.dirname(src);
         const dest = `${dir}/${base} copy${ext}`;
         const { code } = await sshExec(host, `cp -r ${JSON.stringify(src)} ${JSON.stringify(dest)}`);
         return code === 0 ? c.json({ success: true }) : c.json({ error: "Failed to duplicate" }, 500);
@@ -713,6 +787,9 @@ app.all("/api/d/:deviceId/*", async (c) => {
 
       return c.json({ error: `Unsupported SSH operation: ${suffix}` }, 400);
     } catch (err: any) {
+      if (err instanceof InvalidPathError) {
+        return c.json({ error: err.message }, 400);
+      }
       return c.json({ error: `SSH error: ${err.message}` }, 502);
     }
   }
@@ -772,16 +849,50 @@ function getFileIcon(filename: string, isDir: boolean): string {
   return getFileType(filename);
 }
 
-// Resolve and validate path (prevent directory traversal)
-function resolveSafePath(requestedPath: string): string | null {
-  const resolved = path.resolve(ROOT_DIR, requestedPath);
-  if (!resolved.startsWith(ROOT_DIR)) {
-    return null;
-  }
-  return resolved;
+function isPathInside(rootPath: string, targetPath: string): boolean {
+  const relative = path.relative(rootPath, targetPath);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-app.use("*", cors());
+function findNearestExistingPath(targetPath: string): string | null {
+  let current = targetPath;
+  while (true) {
+    if (fs.existsSync(current)) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+// Resolve and validate path (prevent traversal and symlink escapes)
+function resolveSafePath(requestedPath: string, options: { allowNonExistent?: boolean } = {}): string | null {
+  if (typeof requestedPath !== "string") return null;
+  const allowNonExistent = Boolean(options.allowNonExistent);
+  const candidate = path.resolve(ROOT_DIR_ABS, requestedPath);
+
+  if (!isPathInside(ROOT_DIR_ABS, candidate)) return null;
+
+  const candidateExists = fs.existsSync(candidate);
+  try {
+    const realCandidate = fs.realpathSync(candidate);
+    if (!isPathInside(ROOT_DIR_REAL, realCandidate)) return null;
+    return realCandidate;
+  } catch {
+    if (candidateExists || !allowNonExistent) return null;
+
+    const nearestExisting = findNearestExistingPath(candidate);
+    if (!nearestExisting) return null;
+
+    try {
+      const realAncestor = fs.realpathSync(nearestExisting);
+      if (!isPathInside(ROOT_DIR_REAL, realAncestor)) return null;
+    } catch {
+      return null;
+    }
+
+    return candidate;
+  }
+}
 
 // API: List directory contents
 app.get("/api/files", async (c) => {
@@ -804,7 +915,7 @@ app.get("/api/files", async (c) => {
       .filter(entry => showHidden || !entry.name.startsWith(".")) // Hide hidden files unless requested
       .map(entry => {
         const fullPath = path.join(safePath, entry.name);
-        const relativePath = path.relative(ROOT_DIR, fullPath);
+        const relativePath = path.relative(ROOT_DIR_REAL, fullPath);
         let stats: fs.Stats | null = null;
 
         try {
@@ -830,7 +941,7 @@ app.get("/api/files", async (c) => {
         return a.name.localeCompare(b.name);
       });
 
-    const relativePath = path.relative(ROOT_DIR, safePath);
+    const relativePath = path.relative(ROOT_DIR_REAL, safePath);
     const breadcrumbs = relativePath
       ? relativePath.split(path.sep).map((name, i, arr) => ({
           name,
@@ -895,7 +1006,7 @@ app.get("/api/search", async (c) => {
         if (entry.name.startsWith(".")) continue;
 
         const fullPath = path.join(dir, entry.name);
-        const relativePath = path.relative(ROOT_DIR, fullPath);
+        const relativePath = path.relative(ROOT_DIR_REAL, fullPath);
 
         results.push({
           name: entry.name,
@@ -1086,7 +1197,7 @@ app.get("/api/info", async (c) => {
 // API: Create folder
 app.post("/api/mkdir", async (c) => {
   const { path: dirPath } = await c.req.json();
-  const safePath = resolveSafePath(dirPath);
+  const safePath = resolveSafePath(dirPath, { allowNonExistent: true });
   if (!safePath) return c.json({ error: "Invalid path" }, 400);
   try {
     fs.mkdirSync(safePath, { recursive: true });
@@ -1099,7 +1210,7 @@ app.post("/api/mkdir", async (c) => {
 // API: Create file
 app.post("/api/touch", async (c) => {
   const { path: filePath, content } = await c.req.json();
-  const safePath = resolveSafePath(filePath);
+  const safePath = resolveSafePath(filePath, { allowNonExistent: true });
   if (!safePath) return c.json({ error: "Invalid path" }, 400);
   try {
     const dir = path.dirname(safePath);
@@ -1115,7 +1226,7 @@ app.post("/api/touch", async (c) => {
 app.post("/api/rename", async (c) => {
   const { from, to } = await c.req.json();
   const safeFrom = resolveSafePath(from);
-  const safeTo = resolveSafePath(to);
+  const safeTo = resolveSafePath(to, { allowNonExistent: true });
   if (!safeFrom || !safeTo) return c.json({ error: "Invalid path" }, 400);
   try {
     if (fs.existsSync(safeTo)) return c.json({ error: "Destination already exists" }, 409);
@@ -1132,7 +1243,7 @@ app.post("/api/delete", async (c) => {
   const safePath = resolveSafePath(targetPath);
   if (!safePath) return c.json({ error: "Invalid path" }, 400);
   // Safety: don't delete the root
-  if (safePath === ROOT_DIR) return c.json({ error: "Cannot delete root directory" }, 400);
+  if (safePath === ROOT_DIR_REAL) return c.json({ error: "Cannot delete root directory" }, 400);
   try {
     const stats = fs.statSync(safePath);
     if (stats.isDirectory()) {
@@ -1149,7 +1260,7 @@ app.post("/api/delete", async (c) => {
 // API: Save file content
 app.post("/api/save", async (c) => {
   const { path: filePath, content } = await c.req.json();
-  const safePath = resolveSafePath(filePath);
+  const safePath = resolveSafePath(filePath, { allowNonExistent: true });
   if (!safePath) return c.json({ error: "Invalid path" }, 400);
   try {
     fs.writeFileSync(safePath, content, "utf-8");
@@ -1165,12 +1276,12 @@ app.post("/api/upload", async (c) => {
   const file = formData.get("file") as File | null;
   const targetDir = formData.get("path") as string || "";
   if (!file) return c.json({ error: "No file provided" }, 400);
-  const safePath = resolveSafePath(path.join(targetDir, file.name));
+  const safePath = resolveSafePath(path.join(targetDir, file.name), { allowNonExistent: true });
   if (!safePath) return c.json({ error: "Invalid path" }, 400);
   try {
     const buffer = await file.arrayBuffer();
     fs.writeFileSync(safePath, Buffer.from(buffer));
-    return c.json({ success: true, path: path.relative(ROOT_DIR, safePath) });
+    return c.json({ success: true, path: path.relative(ROOT_DIR_REAL, safePath) });
   } catch (error: any) {
     return c.json({ error: error.message || "Failed to upload" }, 500);
   }
@@ -1199,7 +1310,7 @@ app.post("/api/duplicate", async (c) => {
     } else {
       fs.copyFileSync(safeSrc, copyPath);
     }
-    return c.json({ success: true, path: path.relative(ROOT_DIR, copyPath) });
+    return c.json({ success: true, path: path.relative(ROOT_DIR_REAL, copyPath) });
   } catch (error: any) {
     return c.json({ error: error.message || "Failed to duplicate" }, 500);
   }

@@ -37,7 +37,13 @@ beforeAll(async () => {
   ensureSandbox();
   proc = Bun.spawn(["bun", "server/index.ts"], {
     cwd: path.join(import.meta.dir, ".."),
-    env: { ...process.env, PORT: String(PORT), FILE_EXPLORER_ROOT: SANDBOX, FILE_EXPLORER_DATA: DATA_DIR },
+    env: {
+      ...process.env,
+      PORT: String(PORT),
+      FILE_EXPLORER_ROOT: SANDBOX,
+      FILE_EXPLORER_DATA: DATA_DIR,
+      FILE_EXPLORER_ALLOW_NO_AUTH: "true",
+    },
     stdout: "ignore",
     stderr: "ignore",
   });
