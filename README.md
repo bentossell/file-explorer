@@ -3,6 +3,8 @@
 Self-hosted multi-machine file browser.
 built with [droid](https://factory.ai)
 
+![File Explorer](screenshot.png)
+
 ## Model
 
 - One instance is your `hub` (UI + device registry + proxy).
