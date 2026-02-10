@@ -26,7 +26,9 @@ const ROOT_DIR = process.env.FILE_EXPLORER_ROOT || process.env.HOME || "/";
 interface DeviceConfig {
   id: string;
   name: string;
-  url: string;       // base URL of the remote file-explorer instance e.g. http://192.168.1.5:3456
+  url: string;        // base URL for HTTP-proxy devices (legacy)
+  sshHost?: string;   // SSH host alias (e.g. "macbook", "bens-macbook-air") — preferred
+  sshRoot?: string;   // root dir on remote (defaults to $HOME)
   icon?: string;      // emoji or identifier
   enabled: boolean;
 }
@@ -92,6 +94,147 @@ function getLocalIcon(): string {
   return settings.localIcon || "💻";
 }
 
+// ─── SSH Helpers ─────────────────────────────────────────────────────────────
+
+import { spawn } from "child_process";
+
+function sshExec(host: string, command: string, timeoutMs = 15000): Promise<{ stdout: string; stderr: string; code: number }> {
+  return new Promise((resolve) => {
+    const proc = spawn("ssh", ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", host, command], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    const timer = setTimeout(() => { proc.kill(); resolve({ stdout, stderr: "timeout", code: 124 }); }, timeoutMs);
+    proc.on("close", (code) => { clearTimeout(timer); resolve({ stdout, stderr, code: code ?? 1 }); });
+  });
+}
+
+function sshExecBinary(host: string, command: string, timeoutMs = 30000): Promise<{ data: Buffer; code: number }> {
+  return new Promise((resolve) => {
+    const proc = spawn("ssh", ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", host, command], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const chunks: Buffer[] = [];
+    proc.stdout.on("data", (d: Buffer) => { chunks.push(d); });
+    const timer = setTimeout(() => { proc.kill(); resolve({ data: Buffer.concat(chunks), code: 124 }); }, timeoutMs);
+    proc.on("close", (code) => { clearTimeout(timer); resolve({ data: Buffer.concat(chunks), code: code ?? 1 }); });
+  });
+}
+
+// SSH-based file listing (mirrors /api/files response shape)
+async function sshListFiles(host: string, rootDir: string, requestedPath: string, showHidden: boolean) {
+  const targetDir = requestedPath ? `${rootDir}/${requestedPath}` : rootDir;
+  // Use a single ssh call that outputs JSON-ish data we can parse
+  // stat format: type|name|size|mtime
+  const hiddenFlag = showHidden ? "-a" : "";
+  const cmd = `cd ${JSON.stringify(targetDir)} 2>/dev/null && ls -1 ${hiddenFlag} --color=never 2>/dev/null | while IFS= read -r name; do
+    [ "$name" = "." ] || [ "$name" = ".." ] && continue
+    stat -f '%HT|%N|%z|%m' "$name" 2>/dev/null || stat --format='%F|%n|%s|%Y' "$name" 2>/dev/null
+  done`;
+  const { stdout, code } = await sshExec(host, cmd);
+  if (code !== 0 && !stdout.trim()) throw new Error("Failed to list directory");
+
+  const files = stdout.trim().split("\n").filter(Boolean).map((line) => {
+    const [type, name, sizeStr, mtimeStr] = line.split("|");
+    const isDir = type === "Directory" || type === "directory";
+    const size = parseInt(sizeStr) || 0;
+    const modified = new Date(parseInt(mtimeStr) * 1000).toISOString();
+    const relativePath = requestedPath ? `${requestedPath}/${name}` : name;
+    return {
+      name,
+      path: relativePath,
+      isDirectory: isDir,
+      icon: isDir ? "folder" : getFileType(name),
+      size: isDir ? 0 : size,
+      modified,
+    };
+  }).sort((a, b) => {
+    if (a.isDirectory && !b.isDirectory) return -1;
+    if (!a.isDirectory && b.isDirectory) return 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  const breadcrumbs: Array<{ name: string; path: string }> = [{ name: "Home", path: "" }];
+  if (requestedPath) {
+    const parts = requestedPath.split("/");
+    parts.forEach((name, i) => {
+      breadcrumbs.push({ name, path: parts.slice(0, i + 1).join("/") });
+    });
+  }
+
+  return { path: requestedPath, breadcrumbs, files };
+}
+
+async function sshSearch(host: string, rootDir: string, searchPath: string, query: string) {
+  const targetDir = searchPath ? `${rootDir}/${searchPath}` : rootDir;
+  const cmd = `find ${JSON.stringify(targetDir)} -maxdepth 5 -name '*' 2>/dev/null | head -500`;
+  const { stdout } = await sshExec(host, cmd);
+  const allPaths = stdout.trim().split("\n").filter(Boolean);
+  const items = allPaths.map((fullPath) => {
+    const relativePath = fullPath.startsWith(rootDir) ? fullPath.slice(rootDir.length + 1) : fullPath;
+    const name = path.basename(fullPath);
+    return { name, path: relativePath, isDirectory: false, icon: getFileType(name), size: 0 };
+  }).filter((f) => f.name && !f.name.startsWith("."));
+
+  const fuse = new Fuse(items, { keys: ["name"], threshold: 0.4, includeScore: true });
+  return { results: fuse.search(query).slice(0, 50).map((r) => r.item) };
+}
+
+async function sshPreview(host: string, rootDir: string, filePath: string) {
+  const fullPath = `${rootDir}/${filePath}`;
+  const ext = path.extname(filePath).toLowerCase();
+  const fileType = getFileType(path.basename(filePath));
+
+  if (fileType === "image") {
+    const { data, code } = await sshExecBinary(host, `cat ${JSON.stringify(fullPath)}`);
+    if (code !== 0) throw new Error("Failed to read file");
+    const base64 = data.toString("base64");
+    const mimeTypes: Record<string, string> = {
+      ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+      ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+    };
+    return { type: "image", mimeType: mimeTypes[ext] || "image/png", content: base64 };
+  }
+
+  if (fileType === "code" || ext === ".txt" || ext === ".md") {
+    const { stdout, code } = await sshExec(host, `head -c 500000 ${JSON.stringify(fullPath)}`);
+    if (code !== 0) throw new Error("Failed to read file");
+    return { type: "text", language: ext.slice(1), content: stdout };
+  }
+
+  return { type: "unsupported", message: `Preview not available for ${ext} files` };
+}
+
+async function sshFileInfo(host: string, rootDir: string, filePath: string) {
+  const fullPath = `${rootDir}/${filePath}`;
+  const name = path.basename(filePath);
+  // Try macOS stat first, then Linux stat
+  const cmd = `stat -f '%z|%B|%m|%a|%HT' ${JSON.stringify(fullPath)} 2>/dev/null || stat --format='%s|%W|%Y|%X|%F' ${JSON.stringify(fullPath)} 2>/dev/null`;
+  const { stdout, code } = await sshExec(host, cmd);
+  if (code !== 0) throw new Error("Failed to get info");
+  const [sizeStr, createdStr, modifiedStr, accessedStr, type] = stdout.trim().split("|");
+  const isDir = type === "Directory" || type === "directory";
+  return {
+    name, path: filePath, isDirectory: isDir,
+    size: parseInt(sizeStr) || 0,
+    created: new Date(parseInt(createdStr) * 1000).toISOString(),
+    modified: new Date(parseInt(modifiedStr) * 1000).toISOString(),
+    accessed: new Date(parseInt(accessedStr) * 1000).toISOString(),
+    icon: isDir ? "folder" : getFileType(name),
+    type: isDir ? "folder" : getFileType(name),
+  };
+}
+
+async function sshDownload(host: string, rootDir: string, filePath: string) {
+  const fullPath = `${rootDir}/${filePath}`;
+  const { data, code } = await sshExecBinary(host, `cat ${JSON.stringify(fullPath)}`);
+  if (code !== 0) throw new Error("Failed to download");
+  return data;
+}
+
 // ─── Identity ────────────────────────────────────────────────────────────────
 // Returns this machine's identity so remote instances can register it
 
@@ -131,11 +274,39 @@ app.get("/api/devices", (c) => {
   return c.json({ devices: [local, ...devices] });
 });
 
-// Add a device
+// Add a device (SSH or HTTP)
 app.post("/api/devices", async (c) => {
   const body = await c.req.json();
-  const { name, url, icon } = body;
-  if (!name || !url) return c.json({ error: "name and url required" }, 400);
+  const { name, url, icon, sshHost, sshRoot } = body;
+
+  // SSH device — just needs sshHost
+  if (sshHost) {
+    const deviceName = name || sshHost;
+    const devices = loadDevices();
+    const id = deviceName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || `device-${Date.now()}`;
+    if (id === "local" || devices.some((d) => d.id === id)) {
+      return c.json({ error: "Device ID already exists" }, 409);
+    }
+
+    // Test SSH connectivity
+    const { stdout, code } = await sshExec(sshHost, "echo ok && echo $HOME", 8000);
+    if (code !== 0 || !stdout.includes("ok")) {
+      return c.json({ error: `Cannot SSH to "${sshHost}" — check your SSH config and keys` }, 502);
+    }
+    const remoteHome = stdout.trim().split("\n").pop() || "/";
+
+    const device: DeviceConfig = {
+      id, name: deviceName, url: "", sshHost,
+      sshRoot: sshRoot || remoteHome,
+      icon: icon || "🖥️", enabled: true,
+    };
+    devices.push(device);
+    saveDevices(devices);
+    return c.json({ success: true, device });
+  }
+
+  // HTTP device (legacy) — needs name + url
+  if (!name || !url) return c.json({ error: "name and url (or sshHost) required" }, 400);
 
   const devices = loadDevices();
   const id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || `device-${Date.now()}`;
@@ -199,6 +370,18 @@ app.get("/api/devices/:id/health", async (c) => {
   if (!device) return c.json({ error: "Device not found" }, 404);
 
   const start = Date.now();
+
+  // SSH device
+  if (device.sshHost) {
+    const { stdout, code } = await sshExec(device.sshHost, "echo ok", 5000);
+    const latency = Date.now() - start;
+    if (code === 0 && stdout.includes("ok")) {
+      return c.json({ status: "ok", latency, type: "ssh" });
+    }
+    return c.json({ status: "unreachable", latency, type: "ssh" });
+  }
+
+  // HTTP device
   try {
     const res = await fetch(`${device.url}/api/files?path=`, { signal: AbortSignal.timeout(5000) });
     const latency = Date.now() - start;
@@ -284,12 +467,13 @@ app.delete("/api/combos/:id", (c) => {
 
 // ─── Device Proxy ────────────────────────────────────────────────────────────
 // Routes: /api/d/:deviceId/files, /api/d/:deviceId/mkdir, etc.
-// For "local" → fall through to normal handlers. For remote → proxy to device URL.
+// For "local" → fall through to normal handlers.
+// For SSH devices → run SSH commands.
+// For HTTP devices → proxy to device URL.
 
 app.all("/api/d/:deviceId/*", async (c) => {
   const deviceId = c.req.param("deviceId");
   if (deviceId === "local") {
-    // Rewrite URL to local handler: /api/d/local/files?x=y → /api/files?x=y
     const suffix = c.req.path.replace(`/api/d/local`, "");
     const localUrl = new URL(c.req.url);
     localUrl.pathname = `/api${suffix}`;
@@ -306,10 +490,122 @@ app.all("/api/d/:deviceId/*", async (c) => {
   if (!device) return c.json({ error: "Device not found" }, 404);
   if (!device.enabled) return c.json({ error: "Device is disabled" }, 403);
 
-  // Proxy to remote device
+  // ─── SSH device ─────────────────────────────────────────────────────────
+  if (device.sshHost) {
+    const host = device.sshHost;
+    const root = device.sshRoot || "/";
+    const suffix = c.req.path.replace(`/api/d/${deviceId}/`, "").split("?")[0];
+    const url = new URL(c.req.url);
+
+    try {
+      if (suffix === "files" && c.req.method === "GET") {
+        const reqPath = url.searchParams.get("path") || "";
+        const showHidden = url.searchParams.get("showHidden") === "true";
+        const data = await sshListFiles(host, root, reqPath, showHidden);
+        return c.json(data);
+      }
+
+      if (suffix === "search" && c.req.method === "GET") {
+        const query = url.searchParams.get("q") || "";
+        const searchPath = url.searchParams.get("path") || "";
+        if (query.length < 2) return c.json({ results: [] });
+        const data = await sshSearch(host, root, searchPath, query);
+        return c.json(data);
+      }
+
+      if (suffix === "preview" && c.req.method === "GET") {
+        const reqPath = url.searchParams.get("path") || "";
+        if (!reqPath) return c.json({ error: "path required" }, 400);
+        const data = await sshPreview(host, root, reqPath);
+        return c.json(data);
+      }
+
+      if (suffix === "info" && c.req.method === "GET") {
+        const reqPath = url.searchParams.get("path") || "";
+        if (!reqPath) return c.json({ error: "path required" }, 400);
+        const data = await sshFileInfo(host, root, reqPath);
+        return c.json(data);
+      }
+
+      if (suffix === "download" && c.req.method === "GET") {
+        const reqPath = url.searchParams.get("path") || "";
+        if (!reqPath) return c.json({ error: "path required" }, 400);
+        const data = await sshDownload(host, root, reqPath);
+        const filename = path.basename(reqPath);
+        return new Response(data, {
+          headers: {
+            "Content-Disposition": `attachment; filename="${filename}"`,
+            "Content-Type": "application/octet-stream",
+          },
+        });
+      }
+
+      if (suffix === "mkdir" && c.req.method === "POST") {
+        const body = await c.req.json();
+        const dirPath = `${root}/${body.path}`;
+        const { code } = await sshExec(host, `mkdir -p ${JSON.stringify(dirPath)}`);
+        return code === 0 ? c.json({ success: true }) : c.json({ error: "Failed to create folder" }, 500);
+      }
+
+      if (suffix === "touch" && c.req.method === "POST") {
+        const body = await c.req.json();
+        const filePath = `${root}/${body.path}`;
+        const dir = path.dirname(filePath);
+        const content = body.content || "";
+        const cmd = `mkdir -p ${JSON.stringify(dir)} && cat > ${JSON.stringify(filePath)} << 'SSHEOF'\n${content}\nSSHEOF`;
+        const { code } = await sshExec(host, cmd);
+        return code === 0 ? c.json({ success: true }) : c.json({ error: "Failed to create file" }, 500);
+      }
+
+      if (suffix === "rename" && c.req.method === "POST") {
+        const body = await c.req.json();
+        const from = `${root}/${body.from}`;
+        const to = `${root}/${body.to}`;
+        const { code } = await sshExec(host, `mv ${JSON.stringify(from)} ${JSON.stringify(to)}`);
+        return code === 0 ? c.json({ success: true }) : c.json({ error: "Failed to rename" }, 500);
+      }
+
+      if (suffix === "delete" && c.req.method === "POST") {
+        const body = await c.req.json();
+        const targetPath = `${root}/${body.path}`;
+        // Safety: don't delete root
+        if (targetPath === root) return c.json({ error: "Cannot delete root" }, 400);
+        const { code } = await sshExec(host, `rm -rf ${JSON.stringify(targetPath)}`);
+        return code === 0 ? c.json({ success: true }) : c.json({ error: "Failed to delete" }, 500);
+      }
+
+      if (suffix === "save" && c.req.method === "POST") {
+        const body = await c.req.json();
+        const filePath = `${root}/${body.path}`;
+        // Use base64 to safely transfer content
+        const b64 = Buffer.from(body.content || "").toString("base64");
+        const { code } = await sshExec(host, `echo '${b64}' | base64 -d > ${JSON.stringify(filePath)}`);
+        return code === 0 ? c.json({ success: true }) : c.json({ error: "Failed to save" }, 500);
+      }
+
+      if (suffix === "duplicate" && c.req.method === "POST") {
+        const body = await c.req.json();
+        const src = `${root}/${body.path}`;
+        const ext = path.extname(src);
+        const base = path.basename(src, ext);
+        const dir = path.dirname(src);
+        const dest = `${dir}/${base} copy${ext}`;
+        const { code } = await sshExec(host, `cp -r ${JSON.stringify(src)} ${JSON.stringify(dest)}`);
+        return code === 0 ? c.json({ success: true }) : c.json({ error: "Failed to duplicate" }, 500);
+      }
+
+      // Recent — not supported for SSH, return empty
+      if (suffix === "recent") return c.json({ files: [] });
+
+      return c.json({ error: `Unsupported SSH operation: ${suffix}` }, 400);
+    } catch (err: any) {
+      return c.json({ error: `SSH error: ${err.message}` }, 502);
+    }
+  }
+
+  // ─── HTTP proxy device ──────────────────────────────────────────────────
   const suffix = c.req.path.replace(`/api/d/${deviceId}`, "");
   const remoteUrl = new URL(`${device.url}/api${suffix}`);
-  // Forward query params
   const originalUrl = new URL(c.req.url);
   originalUrl.searchParams.forEach((v, k) => remoteUrl.searchParams.set(k, v));
 
@@ -326,7 +622,6 @@ app.all("/api/d/:deviceId/*", async (c) => {
       signal: proxyController.signal,
     }).finally(() => clearTimeout(proxyTimeout));
 
-    // Forward the response
     return new Response(proxyRes.body, {
       status: proxyRes.status,
       headers: proxyRes.headers,

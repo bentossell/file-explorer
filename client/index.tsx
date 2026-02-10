@@ -55,6 +55,8 @@ interface Device {
   id: string;
   name: string;
   url: string;
+  sshHost?: string;
+  sshRoot?: string;
   icon?: string;
   enabled: boolean;
   isLocal?: boolean;
@@ -438,7 +440,7 @@ const devicesApi = {
   async list(): Promise<{ devices: Device[] }> {
     const res = await fetch("/api/devices"); return res.json();
   },
-  async add(device: { name: string; url: string; icon?: string }): Promise<{ success?: boolean; device?: Device; error?: string }> {
+  async add(device: { name?: string; url?: string; icon?: string; sshHost?: string; sshRoot?: string }): Promise<{ success?: boolean; device?: Device; error?: string }> {
     const res = await fetch("/api/devices", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(device) }); return res.json();
   },
   async update(id: string, data: Partial<Device>): Promise<{ success?: boolean; error?: string }> {
@@ -1387,7 +1389,7 @@ function DeviceManager({
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-medium text-ink-800 dark:text-ink-200 truncate">{d.name}</div>
                       <div className="text-[10px] text-sand-400 dark:text-ink-600 font-mono truncate">
-                        {d.isLocal ? "This machine" : d.url}
+                        {d.isLocal ? "This machine" : d.sshHost ? `ssh ${d.sshHost}` : d.url}
                       </div>
                     </div>
                     {/* Status */}
@@ -1638,23 +1640,19 @@ function DeviceSwitcher({
 }) {
   const [open, setOpen] = useState(false);
   const [health, setHealth] = useState<Record<string, string>>({});
-  const [addMode, setAddMode] = useState<false | "detect" | "manual" | "detected">(false);
-  const [localProbe, setLocalProbe] = useState<{ name: string; icon: string; hostname: string; port: number; ips: string[] } | null>(null);
-  const [probing, setProbing] = useState(false);
-  const [addUrl, setAddUrl] = useState("");
+  const [showAdd, setShowAdd] = useState(false);
+  const [sshHost, setSshHost] = useState("");
   const [adding, setAdding] = useState(false);
   const [addError, setAddError] = useState("");
-  const [copied, setCopied] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  const urlRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) { setOpen(false); setAddMode(false); } };
+    const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) { setOpen(false); setShowAdd(false); } };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  // Health check remotes when opening
   useEffect(() => {
     if (open) {
       devices.filter((d) => !d.isLocal).forEach(async (d) => {
@@ -1666,126 +1664,29 @@ function DeviceSwitcher({
     }
   }, [open]);
 
-  // When "Add This Machine" clicked, probe localhost to see if file-explorer is running
-  const probeLocalMachine = async () => {
-    setAddMode("detect");
-    setProbing(true);
-    setLocalProbe(null);
-    setAddError("");
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3000);
-      const res = await fetch("http://localhost:3456/api/whoami", { signal: controller.signal }).finally(() => clearTimeout(timeout));
-      if (res.ok) {
-        const data = await res.json();
-        setLocalProbe(data);
-        setAddMode("detected");
-      } else {
-        setAddMode("manual");
-      }
-    } catch {
-      setAddMode("manual");
-    }
-    setProbing(false);
-  };
+  useEffect(() => {
+    if (showAdd) setTimeout(() => inputRef.current?.focus(), 50);
+  }, [showAdd]);
 
-  // Register detected local machine with the hub
-  const registerDetected = async () => {
-    if (!localProbe) return;
-    setAdding(true);
-    setAddError("");
-
-    // Figure out best URL the hub can reach
-    // If we're accessing the hub via tailscale hostname, use the local machine's hostname too
-    const hubHost = window.location.hostname;
-    let deviceUrl = "";
-
-    // Try: same hostname pattern — if hub is at bens-mac-mini.taild3a34a.ts.net,
-    // try the local machine's hostname with same tailscale domain
-    if (hubHost.includes(".ts.net")) {
-      const tsDomain = hubHost.substring(hubHost.indexOf("."));
-      deviceUrl = `http://${localProbe.hostname}${tsDomain}:${localProbe.port}`;
-    } else {
-      // Use first non-internal IP
-      const ip = localProbe.ips[0] || "localhost";
-      deviceUrl = `http://${ip}:${localProbe.port}`;
-    }
-
-    try {
-      const res = await devicesApi.add({ name: localProbe.name, url: deviceUrl, icon: localProbe.icon || "💻" });
-      if (res.success) {
-        onToast(`Added: ${res.device?.name}`);
-        setAddMode(false);
-        onRefreshDevices();
-      } else if (res.error?.includes("already exists")) {
-        onToast("Already connected!");
-        setAddMode(false);
-      } else {
-        // If tailscale URL failed, try with IP
-        if (deviceUrl.includes(".ts.net") && localProbe.ips[0]) {
-          const fallbackUrl = `http://${localProbe.ips[0]}:${localProbe.port}`;
-          const res2 = await devicesApi.add({ name: localProbe.name, url: fallbackUrl, icon: localProbe.icon || "💻" });
-          if (res2.success) {
-            onToast(`Added: ${res2.device?.name}`);
-            setAddMode(false);
-            onRefreshDevices();
-          } else {
-            setAddError(res2.error || "Hub can't reach this machine. Try entering the URL manually.");
-            setAddMode("manual");
-            setAddUrl(fallbackUrl);
-          }
-        } else {
-          setAddError(res.error || "Hub can't reach this machine");
-          setAddMode("manual");
-          setAddUrl(deviceUrl);
-        }
-      }
-    } catch (err: any) {
-      setAddError(err.message || "Failed");
-      setAddMode("manual");
-    }
-    setAdding(false);
-  };
-
-  // Manual URL add
-  const handleManualAdd = async () => {
-    const url = addUrl.trim().replace(/\/+$/, "");
-    if (!url) return;
+  const handleAddSSH = async () => {
+    const host = sshHost.trim();
+    if (!host) return;
     setAdding(true);
     setAddError("");
     try {
-      // Try to get name from remote whoami
-      let name = "";
-      let icon = "🖥️";
-      try {
-        const probe = await fetch(`${url}/api/whoami`, { signal: AbortSignal.timeout(3000) });
-        if (probe.ok) {
-          const data = await probe.json();
-          name = data.name || data.hostname || "";
-          icon = data.icon || "🖥️";
-        }
-      } catch { /* fall through */ }
-      if (!name) {
-        try { name = new URL(url).hostname.replace(/\./g, "-").replace(/^-|-$/g, ""); } catch { name = "device"; }
-      }
-      const res = await devicesApi.add({ name, url, icon });
+      const res = await devicesApi.add({ sshHost: host } as any);
       if (res.success) {
         onToast(`Connected: ${res.device?.name}`);
-        setAddUrl(""); setAddMode(false);
+        setSshHost("");
+        setShowAdd(false);
         onRefreshDevices();
       } else {
         setAddError(res.error || "Failed to connect");
       }
     } catch {
-      setAddError("Invalid URL");
+      setAddError("Failed to connect");
     }
     setAdding(false);
-  };
-
-  const copyCommand = () => {
-    navigator.clipboard.writeText("cd ~/repos/file-explorer && bun server/index.ts");
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
   };
 
   const active = devices.find((d) => d.id === activeId) || devices[0];
@@ -1870,92 +1771,44 @@ function DeviceSwitcher({
             </div>
           )}
 
-          {/* Add Machine — the main CTA */}
+          {/* Add Machine */}
           <div className="border-t border-sand-100 dark:border-ink-800 p-2">
-            {!addMode && (
+            {!showAdd ? (
               <button
-                onClick={probeLocalMachine}
+                onClick={() => { setShowAdd(true); setAddError(""); setSshHost(""); }}
                 className="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-lg text-sm font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 hover:bg-ink-800 dark:hover:bg-white transition-colors"
               >
                 {Icons.plus}
-                Add This Machine
+                Add a Machine
               </button>
-            )}
-
-            {/* Detecting... */}
-            {addMode === "detect" && probing && (
-              <div className="flex items-center justify-center gap-2 py-3">
-                <div className="w-4 h-4 border-2 border-sand-200 dark:border-ink-700 border-t-sand-500 dark:border-t-ink-400 rounded-full animate-spin" />
-                <span className="text-xs text-sand-500 dark:text-ink-400">Checking for file-explorer on this machine…</span>
-              </div>
-            )}
-
-            {/* Detected! One-click add */}
-            {addMode === "detected" && localProbe && (
+            ) : (
               <div className="space-y-2">
-                <div className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800">
-                  <span className="text-lg">{localProbe.icon || "💻"}</span>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-emerald-800 dark:text-emerald-300">{localProbe.name}</div>
-                    <div className="text-[10px] text-emerald-600 dark:text-emerald-500 font-mono">Found running on port {localProbe.port}</div>
-                  </div>
-                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                <div className="text-xs text-sand-500 dark:text-ink-400 leading-relaxed px-0.5">
+                  Enter the SSH host name from your SSH config <span className="font-mono text-[10px] text-sand-400 dark:text-ink-500">(~/.ssh/config)</span>
                 </div>
-                <button
-                  onClick={registerDetected}
-                  disabled={adding}
-                  className="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-lg text-sm font-semibold text-white dark:text-ink-900 bg-emerald-600 dark:bg-emerald-500 hover:bg-emerald-700 dark:hover:bg-emerald-400 transition-colors disabled:opacity-50"
-                >
-                  {adding ? "Connecting…" : "Connect This Machine"}
-                </button>
-                {addError && <p className="text-xs text-red-500 dark:text-red-400 px-1">{addError}</p>}
-              </div>
-            )}
-
-            {/* Not found — show setup instructions + manual URL */}
-            {addMode === "manual" && (
-              <div className="space-y-2.5">
-                <div className="px-2 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800">
-                  <div className="text-xs font-medium text-amber-800 dark:text-amber-300 mb-1.5">Not running on this machine</div>
-                  <div className="text-[11px] text-amber-700 dark:text-amber-400 leading-relaxed mb-2">
-                    Start file-explorer on the machine you want to add:
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <code className="flex-1 px-2 py-1.5 bg-amber-100 dark:bg-amber-900/40 rounded text-[10px] font-mono text-amber-900 dark:text-amber-200 truncate">
-                      bun server/index.ts
-                    </code>
-                    <button
-                      onClick={copyCommand}
-                      className="px-2 py-1.5 text-[10px] font-medium bg-amber-200 dark:bg-amber-800 text-amber-800 dark:text-amber-200 rounded hover:bg-amber-300 dark:hover:bg-amber-700 transition-colors"
-                    >
-                      {copied ? "Copied!" : "Copy"}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="text-[10px] font-semibold text-sand-400 dark:text-ink-600 uppercase tracking-widest px-1">Or paste a URL</div>
                 <div className="flex gap-1.5">
                   <input
-                    ref={urlRef}
-                    value={addUrl}
-                    onChange={(e) => { setAddUrl(e.target.value); setAddError(""); }}
-                    onKeyDown={(e) => { if (e.key === "Enter") handleManualAdd(); if (e.key === "Escape") { setOpen(false); setAddMode(false); } }}
-                    placeholder="http://192.168.1.50:3456"
-                    className="flex-1 min-w-0 bg-sand-50 dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-lg px-2.5 py-2 text-xs font-mono text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-600 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
-                    autoFocus
+                    ref={inputRef}
+                    value={sshHost}
+                    onChange={(e) => { setSshHost(e.target.value); setAddError(""); }}
+                    onKeyDown={(e) => { if (e.key === "Enter") handleAddSSH(); if (e.key === "Escape") setShowAdd(false); }}
+                    placeholder="e.g. macbook, vps, my-server"
+                    className="flex-1 min-w-0 bg-sand-50 dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-lg px-2.5 py-2 text-sm font-mono text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-600 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
                   />
                   <button
-                    onClick={handleManualAdd}
-                    disabled={adding || !addUrl.trim()}
-                    className="px-3 py-2 text-xs font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 rounded-lg hover:bg-ink-800 dark:hover:bg-white transition-colors disabled:opacity-30"
+                    onClick={handleAddSSH}
+                    disabled={adding || !sshHost.trim()}
+                    className="px-4 py-2 text-sm font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 rounded-lg hover:bg-ink-800 dark:hover:bg-white transition-colors disabled:opacity-30"
                   >
-                    {adding ? "…" : "Add"}
+                    {adding ? (
+                      <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    ) : "Add"}
                   </button>
                 </div>
-                {addError && <p className="text-xs text-red-500 dark:text-red-400 px-1">{addError}</p>}
+                {addError && <p className="text-xs text-red-500 dark:text-red-400 px-0.5">{addError}</p>}
                 <button
-                  onClick={() => { setAddMode(false); setAddError(""); }}
-                  className="w-full text-xs text-sand-400 dark:text-ink-500 hover:text-ink-600 dark:hover:text-ink-300 py-1 transition-colors"
+                  onClick={() => setShowAdd(false)}
+                  className="w-full text-xs text-sand-400 dark:text-ink-500 hover:text-ink-600 dark:hover:text-ink-300 py-0.5 transition-colors"
                 >
                   Cancel
                 </button>
@@ -1964,7 +1817,7 @@ function DeviceSwitcher({
           </div>
 
           {/* Footer: manage link */}
-          {devices.length > 1 && !addMode && (
+          {devices.length > 1 && !showAdd && (
             <div className="border-t border-sand-100 dark:border-ink-800 p-1.5">
               <button
                 onClick={() => { onOpenManager(); setOpen(false); }}
