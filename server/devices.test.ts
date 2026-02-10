@@ -114,6 +114,22 @@ describe("POST /api/devices", () => {
     expect(list.devices[1].id).toBe("self-loop");
   });
 
+  test("stores remote auth token without exposing it in API responses", async () => {
+    const res = await fetch(`${BASE}/api/devices`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Tokened", url: `http://127.0.0.1:${PORT}`, authToken: "secret-token" }),
+    });
+    const data = await res.json();
+    expect(data.success).toBe(true);
+    expect(data.device.hasAuthToken).toBe(true);
+    expect(data.device.authToken).toBeUndefined();
+
+    const list = await (await fetch(`${BASE}/api/devices`)).json();
+    const tokened = list.devices.find((d: any) => d.id === "tokened");
+    expect(tokened.hasAuthToken).toBe(true);
+    expect(tokened.authToken).toBeUndefined();
+  });
+
   test("rejects duplicate device ID", async () => {
     // Add first
     await fetch(`${BASE}/api/devices`, {

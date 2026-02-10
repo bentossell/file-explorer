@@ -9,7 +9,7 @@
 - Test all: `bun test`
 - Test single: `bun test <path>`
 - Start: `bun run start`
-- Deploy to remote: `./deploy.sh <ssh-host> [hub-url]`
+- Deploy to remote: `./deploy.sh <ssh-host> [hub-url] [device-url]`
 
 ## Project Structure
 
@@ -17,6 +17,7 @@
 - `server/index.test.ts` — Core file API tests (49 tests)
 - `server/devices.test.ts` — Device management + proxy tests (21 tests)
 - `server/settings.test.ts` — Settings + combo views tests (15 tests)
+- `server/auth.test.ts` — Token auth + role enforcement tests
 - `client/index.tsx` — Full React SPA (single file, Tailwind via CDN)
 - `client/index.html` — HTML shell with Tailwind config + custom theme
 - `build.ts` — Bun build script (compiles client to dist/)
@@ -39,6 +40,7 @@
 - `/api/info` — file metadata
 - `/api/mkdir`, `/api/touch`, `/api/rename`, `/api/delete`, `/api/save`, `/api/upload`, `/api/duplicate` — file operations
 - `/api/recent` — recent files tracking
+- `/api/auth/status` — auth mode probe for client unlock flow
 - `/api/devices` — CRUD device registry
 - `/api/devices/:id/health` — health check
 - `/api/d/:deviceId/*` — device proxy

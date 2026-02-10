@@ -10,6 +10,9 @@ interface FileItem {
   icon: string;
   size: number;
   modified?: string;
+  deviceId?: string;
+  deviceName?: string;
+  deviceIcon?: string;
 }
 
 interface Breadcrumb {
@@ -60,6 +63,7 @@ interface Device {
   icon?: string;
   enabled: boolean;
   isLocal?: boolean;
+  hasAuthToken?: boolean;
 }
 
 interface ComboView {
@@ -101,6 +105,9 @@ interface Favourite {
   icon: string;
   isDirectory: boolean;
   addedAt: number;
+  deviceId?: string;
+  deviceName?: string;
+  deviceIcon?: string;
 }
 
 function useFavourites() {
@@ -118,17 +125,19 @@ function useFavourites() {
     localStorage.setItem("favourites", JSON.stringify(next));
   };
 
-  const isFavourite = (path: string) => favourites.some((f) => f.path === path);
+  const isFavourite = (path: string, deviceId?: string) =>
+    favourites.some((f) => f.path === path && (f.deviceId || "local") === (deviceId || "local"));
 
-  const toggle = (item: { path: string; name: string; icon: string; isDirectory: boolean }) => {
-    if (isFavourite(item.path)) {
-      persist(favourites.filter((f) => f.path !== item.path));
+  const toggle = (item: { path: string; name: string; icon: string; isDirectory: boolean; deviceId?: string; deviceName?: string; deviceIcon?: string }) => {
+    if (isFavourite(item.path, item.deviceId)) {
+      persist(favourites.filter((f) => !(f.path === item.path && (f.deviceId || "local") === (item.deviceId || "local"))));
     } else {
       persist([{ ...item, addedAt: Date.now() }, ...favourites]);
     }
   };
 
-  const remove = (path: string) => persist(favourites.filter((f) => f.path !== path));
+  const remove = (path: string, deviceId?: string) =>
+    persist(favourites.filter((f) => !(f.path === path && (f.deviceId || "local") === (deviceId || "local"))));
 
   return { favourites, isFavourite, toggle, remove };
 }
@@ -373,104 +382,201 @@ const timeAgo = (timestamp: number): string => {
 
 // ─── API ─────────────────────────────────────────────────────────────────────
 
+const API_TOKEN_STORAGE_KEY = "file_explorer_api_token";
+
+let inMemoryApiToken = (() => {
+  if (typeof window === "undefined") return "";
+  return localStorage.getItem(API_TOKEN_STORAGE_KEY) || "";
+})();
+
+function getApiToken(): string {
+  return inMemoryApiToken;
+}
+
+function setApiToken(token: string) {
+  inMemoryApiToken = token.trim();
+  if (typeof window !== "undefined") {
+    if (inMemoryApiToken) localStorage.setItem(API_TOKEN_STORAGE_KEY, inMemoryApiToken);
+    else localStorage.removeItem(API_TOKEN_STORAGE_KEY);
+  }
+}
+
+function clearApiToken() {
+  setApiToken("");
+}
+
+function withAuthHeaders(headers?: HeadersInit): Headers {
+  const merged = new Headers(headers || {});
+  const token = getApiToken();
+  if (token) merged.set("Authorization", `Bearer ${token}`);
+  return merged;
+}
+
+function withAuthQuery(url: string): string {
+  const token = getApiToken();
+  if (!token) return url;
+  const base = typeof window !== "undefined" ? window.location.origin : "http://localhost";
+  const parsed = new URL(url, base);
+  parsed.searchParams.set("token", token);
+  return `${parsed.pathname}${parsed.search}`;
+}
+
+async function apiFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(input, { ...init, headers: withAuthHeaders(init.headers) });
+}
+
+async function readJson<T>(res: Response): Promise<T> {
+  const data = await res.json();
+  if (res.status === 401 || res.status === 403) {
+    const message = (data && typeof data.error === "string" && data.error) || `Request failed (${res.status})`;
+    throw new Error(message);
+  }
+  return data as T;
+}
+
+const isAuthError = (err: unknown) => {
+  const msg = err instanceof Error ? err.message : String(err || "");
+  return msg.toLowerCase().includes("unauthorized") || msg.toLowerCase().includes("admin token required");
+};
+
+function normalizeMachineUrl(input: string): string {
+  const raw = input.trim();
+  if (!raw) return "";
+  const withProtocol = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
+  const parsed = new URL(withProtocol);
+  parsed.pathname = "";
+  parsed.search = "";
+  parsed.hash = "";
+  if (!parsed.port) parsed.port = "3456";
+  return parsed.toString().replace(/\/$/, "");
+}
+
+function addMachineHelp(error?: string): string {
+  const base = (error || "Failed to connect").trim();
+  const lower = base.toLowerCase();
+  if (
+    lower.includes("cannot reach") ||
+    lower.includes("remote returned") ||
+    lower.includes("failed to connect")
+  ) {
+    return `${base}. Check remote is running file-explorer on :3456 and reachable from this hub.`;
+  }
+  return base;
+}
+
 // Device-aware API: routes through /api/d/:deviceId/ for multi-device support
 function createApi(deviceId: string) {
   const base = `/api/d/${deviceId}`;
   return {
     async getFiles(path: string, showHidden: boolean = false): Promise<DirectoryResponse> {
-      const res = await fetch(`${base}/files?path=${encodeURIComponent(path)}&showHidden=${showHidden}`);
-      return res.json();
+      const res = await apiFetch(`${base}/files?path=${encodeURIComponent(path)}&showHidden=${showHidden}`);
+      return readJson(res);
     },
     async search(query: string, path: string = ""): Promise<{ results: FileItem[] }> {
-      const res = await fetch(`${base}/search?q=${encodeURIComponent(query)}&path=${encodeURIComponent(path)}`);
-      return res.json();
+      const res = await apiFetch(`${base}/search?q=${encodeURIComponent(query)}&path=${encodeURIComponent(path)}`);
+      return readJson(res);
     },
     async getRecent(): Promise<{ files: RecentFile[] }> {
-      const res = await fetch(`${base}/recent`);
-      return res.json();
+      const res = await apiFetch(`${base}/recent`);
+      return readJson(res);
     },
     async trackRecent(file: { path: string; name: string; type: string; size: number }) {
-      await fetch(`${base}/recent`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(file) });
+      await apiFetch(`${base}/recent`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(file) });
     },
     async getPreview(path: string): Promise<PreviewData> {
-      const res = await fetch(`${base}/preview?path=${encodeURIComponent(path)}`);
-      return res.json();
+      const res = await apiFetch(`${base}/preview?path=${encodeURIComponent(path)}`);
+      return readJson(res);
     },
     async getInfo(path: string): Promise<FileInfo> {
-      const res = await fetch(`${base}/info?path=${encodeURIComponent(path)}`);
-      return res.json();
+      const res = await apiFetch(`${base}/info?path=${encodeURIComponent(path)}`);
+      return readJson(res);
     },
     getDownloadUrl(path: string): string {
-      return `${base}/download?path=${encodeURIComponent(path)}`;
+      return withAuthQuery(`${base}/download?path=${encodeURIComponent(path)}`);
     },
     async mkdir(dirPath: string): Promise<{ success?: boolean; error?: string }> {
-      const res = await fetch(`${base}/mkdir`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: dirPath }) });
-      return res.json();
+      const res = await apiFetch(`${base}/mkdir`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: dirPath }) });
+      return readJson(res);
     },
     async touch(filePath: string, content = ""): Promise<{ success?: boolean; error?: string }> {
-      const res = await fetch(`${base}/touch`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: filePath, content }) });
-      return res.json();
+      const res = await apiFetch(`${base}/touch`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: filePath, content }) });
+      return readJson(res);
     },
     async rename(from: string, to: string): Promise<{ success?: boolean; error?: string }> {
-      const res = await fetch(`${base}/rename`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from, to }) });
-      return res.json();
+      const res = await apiFetch(`${base}/rename`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from, to }) });
+      return readJson(res);
     },
     async deletePath(targetPath: string): Promise<{ success?: boolean; error?: string }> {
-      const res = await fetch(`${base}/delete`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: targetPath }) });
-      return res.json();
+      const res = await apiFetch(`${base}/delete`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: targetPath }) });
+      return readJson(res);
     },
     async save(filePath: string, content: string): Promise<{ success?: boolean; error?: string }> {
-      const res = await fetch(`${base}/save`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: filePath, content }) });
-      return res.json();
+      const res = await apiFetch(`${base}/save`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: filePath, content }) });
+      return readJson(res);
     },
     async upload(targetDir: string, file: File): Promise<{ success?: boolean; path?: string; error?: string }> {
       const formData = new FormData(); formData.append("file", file); formData.append("path", targetDir);
-      const res = await fetch(`${base}/upload`, { method: "POST", body: formData });
-      return res.json();
+      const res = await apiFetch(`${base}/upload`, { method: "POST", body: formData });
+      return readJson(res);
     },
     async duplicate(srcPath: string): Promise<{ success?: boolean; path?: string; error?: string }> {
-      const res = await fetch(`${base}/duplicate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: srcPath }) });
-      return res.json();
+      const res = await apiFetch(`${base}/duplicate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: srcPath }) });
+      return readJson(res);
     },
   };
 }
 
 // Device management API (always local, not device-scoped)
 const devicesApi = {
-  async list(): Promise<{ devices: Device[] }> {
-    const res = await fetch("/api/devices"); return res.json();
+  async authStatus(): Promise<{ required: boolean; hasReadToken: boolean; writeRequiresAdmin: boolean }> {
+    const res = await fetch("/api/auth/status");
+    return readJson(res);
   },
-  async add(device: { name?: string; url?: string; icon?: string; sshHost?: string; sshRoot?: string }): Promise<{ success?: boolean; device?: Device; error?: string }> {
-    const res = await fetch("/api/devices", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(device) }); return res.json();
+  async list(): Promise<{ devices: Device[] }> {
+    const res = await apiFetch("/api/devices");
+    return readJson(res);
+  },
+  async add(device: { name?: string; url?: string; icon?: string; sshHost?: string; sshRoot?: string; authToken?: string }): Promise<{ success?: boolean; device?: Device; error?: string }> {
+    const res = await apiFetch("/api/devices", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(device) });
+    return readJson(res);
   },
   async update(id: string, data: Partial<Device>): Promise<{ success?: boolean; error?: string }> {
-    const res = await fetch(`/api/devices/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) }); return res.json();
+    const res = await apiFetch(`/api/devices/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+    return readJson(res);
   },
   async remove(id: string): Promise<{ success?: boolean; error?: string }> {
-    const res = await fetch(`/api/devices/${id}`, { method: "DELETE" }); return res.json();
+    const res = await apiFetch(`/api/devices/${id}`, { method: "DELETE" });
+    return readJson(res);
   },
   async health(id: string): Promise<{ status: string; latency?: number; error?: string }> {
-    const res = await fetch(`/api/devices/${id}/health`); return res.json();
+    const res = await apiFetch(`/api/devices/${id}/health`);
+    return readJson(res);
   },
   // Settings
   async getSettings(): Promise<Settings> {
-    const res = await fetch("/api/settings"); return res.json();
+    const res = await apiFetch("/api/settings");
+    return readJson(res);
   },
   async updateSettings(data: Partial<Settings>): Promise<{ success?: boolean; settings?: Settings; error?: string }> {
-    const res = await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) }); return res.json();
+    const res = await apiFetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+    return readJson(res);
   },
   // Combo views
   async listCombos(): Promise<{ combos: ComboView[] }> {
-    const res = await fetch("/api/combos"); return res.json();
+    const res = await apiFetch("/api/combos");
+    return readJson(res);
   },
   async addCombo(combo: { name: string; icon?: string; deviceIds: string[] }): Promise<{ success?: boolean; combo?: ComboView; error?: string }> {
-    const res = await fetch("/api/combos", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(combo) }); return res.json();
+    const res = await apiFetch("/api/combos", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(combo) });
+    return readJson(res);
   },
   async updateCombo(id: string, data: Partial<ComboView>): Promise<{ success?: boolean; error?: string }> {
-    const res = await fetch(`/api/combos/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) }); return res.json();
+    const res = await apiFetch(`/api/combos/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+    return readJson(res);
   },
   async removeCombo(id: string): Promise<{ success?: boolean; error?: string }> {
-    const res = await fetch(`/api/combos/${id}`, { method: "DELETE" }); return res.json();
+    const res = await apiFetch(`/api/combos/${id}`, { method: "DELETE" });
+    return readJson(res);
   },
 };
 
@@ -639,7 +745,7 @@ function CommandPalette({
                 )}
                 {!isSearching && searchResults.map((file, i) => (
                   <button
-                    key={file.path}
+                    key={`${file.deviceId || ""}:${file.path}`}
                     onClick={() => { file.isDirectory ? onNavigate(file.path) : onSelectFile(file); onClose(); }}
                     className={`flex items-center gap-3 w-full px-4 py-2.5 text-left transition-colors ${
                       i === selectedIdx
@@ -652,6 +758,7 @@ function CommandPalette({
                       <div className="text-sm font-medium text-ink-800 dark:text-ink-200 truncate">{file.name}</div>
                       <div className="text-[10px] text-sand-400 dark:text-ink-500 truncate font-mono">{file.path}</div>
                     </div>
+                    {file.deviceName && <DeviceTag icon={file.deviceIcon} name={file.deviceName} />}
                   </button>
                 ))}
               </>
@@ -803,6 +910,70 @@ function Toast({ message, onDone }: { message: string; onDone: () => void }) {
   );
 }
 
+function AuthPrompt({
+  open,
+  loading,
+  error,
+  onSubmit,
+  onClear,
+}: {
+  open: boolean;
+  loading: boolean;
+  error: string;
+  onSubmit: (token: string) => void;
+  onClear: () => void;
+}) {
+  const [token, setToken] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setToken(getApiToken());
+    setTimeout(() => inputRef.current?.focus(), 40);
+  }, [open]);
+
+  if (!open) return null;
+
+  return (
+    <>
+      <div className="fixed inset-0 bg-black/40 z-[95]" />
+      <div className="fixed inset-x-0 top-[18vh] mx-auto w-full max-w-md z-[96] animate-slide-up px-4">
+        <div className="bg-white dark:bg-ink-900 rounded-2xl shadow-2xl border border-sand-200 dark:border-ink-800 p-5">
+          <h3 className="text-sm font-bold text-ink-900 dark:text-ink-100">Enter API Token</h3>
+          <p className="text-xs text-sand-500 dark:text-ink-500 mt-1 leading-relaxed">
+            This hub is protected. Use admin token for writes, read token for browse-only.
+          </p>
+          <input
+            ref={inputRef}
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && token.trim()) onSubmit(token.trim()); }}
+            placeholder="paste token"
+            className="w-full mt-3 bg-sand-50 dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-xl px-3 py-2.5 text-sm font-mono text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-600 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
+          />
+          {error && <p className="text-xs text-red-500 dark:text-red-400 mt-2">{error}</p>}
+          <div className="flex gap-2 mt-4">
+            <button
+              onClick={onClear}
+              className="flex-1 py-2 text-sm font-medium text-sand-500 dark:text-ink-400 bg-sand-100 dark:bg-ink-800 rounded-xl hover:bg-sand-200 dark:hover:bg-ink-700 transition-colors"
+            >
+              Clear
+            </button>
+            <button
+              onClick={() => token.trim() && onSubmit(token.trim())}
+              disabled={loading || !token.trim()}
+              className="flex-1 py-2 text-sm font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 rounded-xl hover:bg-ink-800 dark:hover:bg-white transition-colors disabled:opacity-30"
+            >
+              {loading ? "Checking…" : "Unlock"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
 function Breadcrumbs({ items, onNavigate }: { items: Breadcrumb[]; onNavigate: (path: string) => void }) {
   return (
     <nav className="flex items-center gap-0.5 text-sm overflow-x-auto py-1 scrollbar-none">
@@ -822,6 +993,16 @@ function Breadcrumbs({ items, onNavigate }: { items: Breadcrumb[]; onNavigate: (
         </React.Fragment>
       ))}
     </nav>
+  );
+}
+
+function DeviceTag({ icon, name }: { icon?: string; name?: string }) {
+  if (!name) return null;
+  return (
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded-md bg-sand-100 dark:bg-ink-800 text-sand-500 dark:text-ink-400 border border-sand-200/50 dark:border-ink-700/50 whitespace-nowrap">
+      {icon && <span className="text-[10px] leading-none">{icon}</span>}
+      <span className="truncate max-w-[80px]">{name}</span>
+    </span>
   );
 }
 
@@ -879,6 +1060,11 @@ function FileListItem({
             {formatFileSize(file.size)}
           </span>
         )}
+        {file.deviceName && (
+          <div className="mt-1.5">
+            <DeviceTag icon={file.deviceIcon} name={file.deviceName} />
+          </div>
+        )}
       </div>
     );
   }
@@ -897,6 +1083,7 @@ function FileListItem({
       <span className="flex-1 text-sm font-medium text-ink-800 dark:text-ink-200 truncate">
         {file.name}
       </span>
+      {file.deviceName && <DeviceTag icon={file.deviceIcon} name={file.deviceName} />}
       {!file.isDirectory && (
         <>
           <span className="text-xs text-sand-400 dark:text-ink-500 w-16 text-right font-mono tabular-nums">
@@ -961,7 +1148,7 @@ function FavouritesSection({
   favourites: Favourite[];
   onFileClick: (fav: Favourite) => void;
   onNavigate: (path: string) => void;
-  onRemove: (path: string) => void;
+  onRemove: (path: string, deviceId?: string) => void;
 }) {
   if (favourites.length === 0) return null;
 
@@ -974,12 +1161,12 @@ function FavouritesSection({
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2 stagger-children">
         {favourites.map((fav) => (
           <div
-            key={fav.path}
+            key={`${fav.deviceId || "local"}:${fav.path}`}
             onClick={() => fav.isDirectory ? onNavigate(fav.path) : onFileClick(fav)}
             className="group relative flex flex-col items-center p-3.5 rounded-2xl bg-white/60 dark:bg-ink-900/50 hover:bg-white dark:hover:bg-ink-800 border border-sand-100 dark:border-ink-800/50 hover:border-sand-200 dark:hover:border-ink-700 hover:shadow-sm transition-all duration-150 cursor-pointer"
           >
             <button
-              onClick={(e) => { e.stopPropagation(); onRemove(fav.path); }}
+              onClick={(e) => { e.stopPropagation(); onRemove(fav.path, fav.deviceId); }}
               className="absolute top-2 right-2 p-0.5 rounded-md text-amber-500 dark:text-amber-400 hover:text-amber-600 dark:hover:text-amber-300 opacity-0 group-hover:opacity-100 transition-opacity"
               title="Remove from favourites"
             >
@@ -991,6 +1178,11 @@ function FavouritesSection({
             <span className="text-[12px] font-medium text-ink-700 dark:text-ink-300 truncate max-w-full text-center">
               {fav.name}
             </span>
+            {fav.deviceName && (
+              <div className="mt-1">
+                <DeviceTag icon={fav.deviceIcon} name={fav.deviceName} />
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -1011,7 +1203,7 @@ function SearchResults({
     <div className="space-y-0.5 stagger-children">
       {results.map((file) => (
         <button
-          key={file.path}
+          key={`${file.deviceId || ""}:${file.path}`}
           onClick={() => file.isDirectory ? onNavigate(file.path) : onSelect(file)}
           className="flex items-center gap-3 px-3 py-2.5 w-full text-left hover:bg-white dark:hover:bg-ink-800/60 rounded-xl transition-all duration-150"
         >
@@ -1020,6 +1212,7 @@ function SearchResults({
             <div className="text-sm font-medium text-ink-800 dark:text-ink-200 truncate">{file.name}</div>
             <div className="text-[11px] text-sand-400 dark:text-ink-500 truncate font-mono">{file.path}</div>
           </div>
+          {file.deviceName && <DeviceTag icon={file.deviceIcon} name={file.deviceName} />}
         </button>
       ))}
     </div>
@@ -1254,6 +1447,7 @@ function DeviceManager({
   const [tab, setTab] = useState<"devices" | "combos">("devices");
   const [health, setHealth] = useState<Record<string, { status: string; latency?: number }>>({});
   const [addUrl, setAddUrl] = useState("");
+  const [addToken, setAddToken] = useState("");
   const [addName, setAddName] = useState("");
   const [addIcon, setAddIcon] = useState("🖥️");
   const [adding, setAdding] = useState(false);
@@ -1266,6 +1460,9 @@ function DeviceManager({
   const [newComboIcon, setNewComboIcon] = useState("📁");
   const [newComboDevices, setNewComboDevices] = useState<string[]>([]);
   const [creatingCombo, setCreatingCombo] = useState(false);
+  const [editingRemoteId, setEditingRemoteId] = useState<string | null>(null);
+  const [remoteName, setRemoteName] = useState("");
+  const [remoteIcon, setRemoteIcon] = useState("");
 
   const urlRef = useRef<HTMLInputElement>(null);
 
@@ -1285,25 +1482,26 @@ function DeviceManager({
   }, [open, devices]);
 
   const handleAddDevice = async () => {
-    const url = addUrl.trim().replace(/\/+$/, "");
-    if (!url) return;
+    const rawUrl = addUrl.trim();
+    if (!rawUrl) return;
     setAdding(true);
     setAddError("");
     try {
+      const url = normalizeMachineUrl(rawUrl);
       let name = addName.trim();
       if (!name) {
         try { name = new URL(url).hostname.replace(/\./g, "-").replace(/^-|-$/g, ""); } catch { name = "device"; }
       }
-      const res = await devicesApi.add({ name, url, icon: addIcon });
+      const res = await devicesApi.add({ name, url, icon: addIcon, authToken: addToken.trim() || undefined });
       if (res.success) {
         onToast(`Connected: ${res.device?.name}`);
-        setAddUrl(""); setAddName(""); setAddIcon("🖥️");
+        setAddUrl(""); setAddName(""); setAddToken(""); setAddIcon("🖥️");
         onRefresh();
       } else {
-        setAddError(res.error || "Failed to connect");
+        setAddError(addMachineHelp(res.error));
       }
-    } catch {
-      setAddError("Invalid URL");
+    } catch (err: any) {
+      setAddError(addMachineHelp(err?.message || "Invalid URL"));
     }
     setAdding(false);
   };
@@ -1321,6 +1519,21 @@ function DeviceManager({
   const handleSaveLocal = async () => {
     const res = await devicesApi.updateSettings({ localName: localName.trim() || undefined, localIcon: localIcon.trim() || undefined });
     if (res.success) { onToast("Local device updated"); setEditingLocal(false); onRefresh(); }
+  };
+
+  const handleSaveRemote = async () => {
+    if (!editingRemoteId) return;
+    const data: Partial<Device> = {};
+    if (remoteName.trim()) data.name = remoteName.trim();
+    if (remoteIcon.trim()) data.icon = remoteIcon.trim();
+    const res = await devicesApi.update(editingRemoteId, data);
+    if (res.success) { onToast("Device updated"); setEditingRemoteId(null); onRefresh(); }
+  };
+
+  const startEditingRemote = (d: Device) => {
+    setEditingRemoteId(d.id);
+    setRemoteName(d.name);
+    setRemoteIcon(d.icon || "🖥️");
   };
 
   const handleCreateCombo = async () => {
@@ -1416,13 +1629,20 @@ function DeviceManager({
                         {Icons.pencil}
                       </button>
                     ) : (
-                      <div className="flex items-center gap-1">
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => startEditingRemote(d)}
+                          className="p-1 rounded-md text-sand-400 dark:text-ink-500 hover:text-ink-700 dark:hover:text-ink-200 transition-colors"
+                          title="Rename"
+                        >
+                          {Icons.pencil}
+                        </button>
                         <button
                           onClick={() => handleToggleEnabled(d.id, !d.enabled)}
-                          className={`p-1 rounded-md transition-colors ${d.enabled ? "text-emerald-500 hover:text-emerald-600" : "text-sand-300 dark:text-ink-600 hover:text-sand-500"}`}
+                          className={`relative w-8 h-[18px] rounded-full transition-colors ${d.enabled ? "bg-emerald-500" : "bg-sand-300 dark:bg-ink-600"}`}
                           title={d.enabled ? "Disable" : "Enable"}
                         >
-                          {d.enabled ? Icons.check : Icons.close}
+                          <span className={`absolute top-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform ${d.enabled ? "left-[16px]" : "left-[2px]"}`} />
                         </button>
                         <button
                           onClick={() => handleRemoveDevice(d.id, d.name)}
@@ -1467,13 +1687,47 @@ function DeviceManager({
                   </div>
                 )}
 
+                {/* Edit remote device */}
+                {editingRemoteId && (
+                  <div className="p-3 rounded-xl bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-800 space-y-2">
+                    <div className="text-xs font-semibold text-sky-700 dark:text-sky-400 uppercase tracking-widest">Rename Device</div>
+                    <div className="flex gap-2">
+                      <div className="flex flex-wrap gap-1">
+                        {emojiPicker.slice(0, 8).map((e) => (
+                          <button
+                            key={e}
+                            onClick={() => setRemoteIcon(e)}
+                            className={`w-7 h-7 text-sm rounded-lg transition-all ${remoteIcon === e ? "bg-sky-200 dark:bg-sky-800 ring-1 ring-sky-400" : "hover:bg-sky-100 dark:hover:bg-sky-900"}`}
+                          >
+                            {e}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <input
+                      value={remoteName}
+                      onChange={(e) => setRemoteName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") handleSaveRemote(); }}
+                      placeholder="Device name"
+                      className="w-full bg-white dark:bg-ink-900 border border-sand-200 dark:border-ink-700 rounded-lg px-3 py-2 text-sm text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-500 focus:outline-none focus:border-sky-400"
+                    />
+                    <div className="flex gap-2">
+                      <button onClick={() => setEditingRemoteId(null)} className="flex-1 py-1.5 text-xs font-medium text-sand-500 bg-sand-100 dark:bg-ink-800 dark:text-ink-400 rounded-lg">Cancel</button>
+                      <button onClick={handleSaveRemote} className="flex-1 py-1.5 text-xs font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 rounded-lg">Save</button>
+                    </div>
+                  </div>
+                )}
+
                 {/* Add device form */}
                 <div className="p-3 rounded-xl border border-dashed border-sand-300 dark:border-ink-700 space-y-2">
                   <div className="text-xs font-semibold text-sand-500 dark:text-ink-400 uppercase tracking-widest">Add Remote Machine</div>
                   <p className="text-[11px] text-sand-400 dark:text-ink-500 leading-relaxed">
-                    Run <code className="px-1 py-0.5 bg-sand-100 dark:bg-ink-800 rounded text-[10px] font-mono">bun server/index.ts</code> on the remote machine, then paste its URL here.
-                    Uses the same file-explorer code — deploy with <code className="px-1 py-0.5 bg-sand-100 dark:bg-ink-800 rounded text-[10px] font-mono">./deploy.sh &lt;host&gt;</code>
+                    Best path: Tailscale + URL mode. Deploy helper: <code className="px-1 py-0.5 bg-sand-100 dark:bg-ink-800 rounded text-[10px] font-mono">./deploy.sh &lt;host&gt; [hub-url] [device-url]</code>.
+                    Power path: SSH mode from header switcher (no remote web server needed).
                   </p>
+                  <div className="text-[11px] text-sand-500 dark:text-ink-500 leading-relaxed px-0.5">
+                    Run on remote: <code className="px-1 py-0.5 bg-sand-100 dark:bg-ink-800 rounded text-[10px] font-mono">PORT=3456 bun server/index.ts</code>
+                  </div>
                   <div className="flex gap-2">
                     <div className="flex flex-wrap gap-1 w-auto">
                       {emojiPicker.slice(0, 6).map((e) => (
@@ -1493,13 +1747,20 @@ function DeviceManager({
                     placeholder="Name (optional, derived from URL)"
                     className="w-full bg-white dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-lg px-3 py-2 text-sm text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-500 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
                   />
+                  <input
+                    value={addToken}
+                    onChange={(e) => { setAddToken(e.target.value); setAddError(""); }}
+                    placeholder="Remote token (optional)"
+                    type="password"
+                    className="w-full bg-white dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-lg px-3 py-2 text-sm font-mono text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-500 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
+                  />
                   <div className="flex gap-2">
                     <input
                       ref={urlRef}
                       value={addUrl}
                       onChange={(e) => { setAddUrl(e.target.value); setAddError(""); }}
                       onKeyDown={(e) => { if (e.key === "Enter") handleAddDevice(); }}
-                      placeholder="http://192.168.1.50:3456"
+                      placeholder="my-host.your-tailnet.ts.net (auto :3456)"
                       className="flex-1 min-w-0 bg-white dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-lg px-3 py-2 text-sm font-mono text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-500 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
                     />
                     <button
@@ -1641,7 +1902,11 @@ function DeviceSwitcher({
   const [open, setOpen] = useState(false);
   const [health, setHealth] = useState<Record<string, string>>({});
   const [showAdd, setShowAdd] = useState(false);
+  const [addMode, setAddMode] = useState<"ssh" | "url">("ssh");
   const [sshHost, setSshHost] = useState("");
+  const [addUrl, setAddUrl] = useState("");
+  const [addUrlToken, setAddUrlToken] = useState("");
+  const [addName, setAddName] = useState("");
   const [adding, setAdding] = useState(false);
   const [addError, setAddError] = useState("");
   const ref = useRef<HTMLDivElement>(null);
@@ -1681,10 +1946,38 @@ function DeviceSwitcher({
         setShowAdd(false);
         onRefreshDevices();
       } else {
-        setAddError(res.error || "Failed to connect");
+        setAddError(res.error || "SSH failed. Check alias/key from this hub machine.");
       }
     } catch {
-      setAddError("Failed to connect");
+      setAddError("SSH failed. Check alias/key from this hub machine.");
+    }
+    setAdding(false);
+  };
+
+  const handleAddUrl = async () => {
+    const rawUrl = addUrl.trim();
+    if (!rawUrl) return;
+    setAdding(true);
+    setAddError("");
+    try {
+      const url = normalizeMachineUrl(rawUrl);
+      let name = addName.trim();
+      if (!name) {
+        try { name = new URL(url).hostname.split(".")[0]; } catch { name = "device"; }
+      }
+      const res = await devicesApi.add({ name, url, icon: "🖥️", authToken: addUrlToken.trim() || undefined });
+      if (res.success) {
+        onToast(`Connected: ${res.device?.name}`);
+        setAddUrl("");
+        setAddName("");
+        setAddUrlToken("");
+        setShowAdd(false);
+        onRefreshDevices();
+      } else {
+        setAddError(addMachineHelp(res.error));
+      }
+    } catch (err: any) {
+      setAddError(addMachineHelp(err?.message || "Failed to connect"));
     }
     setAdding(false);
   };
@@ -1698,7 +1991,7 @@ function DeviceSwitcher({
   return (
     <div ref={ref} className="relative">
       <button
-        onClick={() => { setOpen(!open); setAddMode(false); setAddError(""); }}
+        onClick={() => { setOpen(!open); setShowAdd(false); setAddError(""); }}
         className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl hover:bg-sand-100 dark:hover:bg-ink-800 text-ink-700 dark:text-ink-300 transition-all text-sm font-medium"
       >
         <span className="text-base leading-none">{displayIcon}</span>
@@ -1715,7 +2008,7 @@ function DeviceSwitcher({
             {devices.filter((d) => d.isLocal || d.enabled).map((d) => (
               <button
                 key={d.id}
-                onClick={() => { onSelect(d.id); setOpen(false); setAddMode(false); }}
+                onClick={() => { onSelect(d.id); setOpen(false); setShowAdd(false); }}
                 className={`group flex items-center gap-2.5 w-full px-3 py-2 rounded-lg text-left text-sm transition-colors ${
                   !unifiedMode && !activeComboId && d.id === activeId
                     ? "bg-sand-100 dark:bg-ink-800 text-ink-900 dark:text-ink-100 font-medium"
@@ -1775,7 +2068,7 @@ function DeviceSwitcher({
           <div className="border-t border-sand-100 dark:border-ink-800 p-2">
             {!showAdd ? (
               <button
-                onClick={() => { setShowAdd(true); setAddError(""); setSshHost(""); }}
+                onClick={() => { setShowAdd(true); setAddError(""); setSshHost(""); setAddUrl(""); setAddName(""); setAddUrlToken(""); }}
                 className="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-lg text-sm font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 hover:bg-ink-800 dark:hover:bg-white transition-colors"
               >
                 {Icons.plus}
@@ -1783,28 +2076,90 @@ function DeviceSwitcher({
               </button>
             ) : (
               <div className="space-y-2">
-                <div className="text-xs text-sand-500 dark:text-ink-400 leading-relaxed px-0.5">
-                  Enter the SSH host name from your SSH config <span className="font-mono text-[10px] text-sand-400 dark:text-ink-500">(~/.ssh/config)</span>
+                {/* Tab switcher */}
+                <div className="flex items-center gap-0.5 p-0.5 rounded-lg bg-sand-100 dark:bg-ink-800">
+                  {(["ssh", "url"] as const).map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => { setAddMode(m); setAddError(""); }}
+                      className={`flex-1 px-2 py-1 text-xs font-medium rounded-md transition-all ${
+                        addMode === m ? "bg-white dark:bg-ink-700 text-ink-900 dark:text-ink-100 shadow-sm" : "text-sand-500 dark:text-ink-400"
+                      }`}
+                    >
+                      {m === "ssh" ? "SSH Host" : "Device URL"}
+                    </button>
+                  ))}
                 </div>
-                <div className="flex gap-1.5">
-                  <input
-                    ref={inputRef}
-                    value={sshHost}
-                    onChange={(e) => { setSshHost(e.target.value); setAddError(""); }}
-                    onKeyDown={(e) => { if (e.key === "Enter") handleAddSSH(); if (e.key === "Escape") setShowAdd(false); }}
-                    placeholder="e.g. macbook, vps, my-server"
-                    className="flex-1 min-w-0 bg-sand-50 dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-lg px-2.5 py-2 text-sm font-mono text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-600 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
-                  />
-                  <button
-                    onClick={handleAddSSH}
-                    disabled={adding || !sshHost.trim()}
-                    className="px-4 py-2 text-sm font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 rounded-lg hover:bg-ink-800 dark:hover:bg-white transition-colors disabled:opacity-30"
-                  >
-                    {adding ? (
-                      <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                    ) : "Add"}
-                  </button>
-                </div>
+
+                {addMode === "ssh" ? (
+                  <>
+                    <div className="text-[11px] text-sand-400 dark:text-ink-500 leading-relaxed px-0.5">
+                      Uses local SSH on this hub. Quick check:
+                      {" "}
+                      <span className="font-mono text-[10px]">ssh my-host 'echo ok'</span>
+                    </div>
+                    <div className="flex gap-1.5">
+                      <input
+                        ref={inputRef}
+                        value={sshHost}
+                        onChange={(e) => { setSshHost(e.target.value); setAddError(""); }}
+                        onKeyDown={(e) => { if (e.key === "Enter") handleAddSSH(); if (e.key === "Escape") setShowAdd(false); }}
+                        placeholder="e.g. my-server, vps"
+                        className="flex-1 min-w-0 bg-sand-50 dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-lg px-2.5 py-2 text-sm font-mono text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-600 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
+                      />
+                      <button
+                        onClick={handleAddSSH}
+                        disabled={adding || !sshHost.trim()}
+                        className="px-4 py-2 text-sm font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 rounded-lg hover:bg-ink-800 dark:hover:bg-white transition-colors disabled:opacity-30"
+                      >
+                        {adding ? (
+                          <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                        ) : "Add"}
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="text-[11px] text-sand-400 dark:text-ink-500 leading-relaxed px-0.5">
+                      Run remote server first:
+                      {" "}
+                      <span className="font-mono text-[10px]">PORT=3456 bun server/index.ts</span>
+                    </div>
+                    <input
+                      value={addName}
+                      onChange={(e) => { setAddName(e.target.value); setAddError(""); }}
+                      placeholder="Name (optional)"
+                      className="w-full bg-sand-50 dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-lg px-2.5 py-2 text-sm text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-600 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
+                    />
+                    <input
+                      value={addUrlToken}
+                      onChange={(e) => { setAddUrlToken(e.target.value); setAddError(""); }}
+                      placeholder="Remote token (optional)"
+                      type="password"
+                      className="w-full bg-sand-50 dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-lg px-2.5 py-2 text-sm font-mono text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-600 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
+                    />
+                    <div className="flex gap-1.5">
+                      <input
+                        ref={inputRef}
+                        value={addUrl}
+                        onChange={(e) => { setAddUrl(e.target.value); setAddError(""); }}
+                        onKeyDown={(e) => { if (e.key === "Enter") handleAddUrl(); if (e.key === "Escape") setShowAdd(false); }}
+                        placeholder="my-host.your-tailnet.ts.net (auto :3456)"
+                        className="flex-1 min-w-0 bg-sand-50 dark:bg-ink-950 border border-sand-200 dark:border-ink-800 rounded-lg px-2.5 py-2 text-sm font-mono text-ink-900 dark:text-ink-100 placeholder-sand-400 dark:placeholder-ink-600 focus:outline-none focus:border-sand-400 dark:focus:border-ink-600"
+                      />
+                      <button
+                        onClick={handleAddUrl}
+                        disabled={adding || !addUrl.trim()}
+                        className="px-4 py-2 text-sm font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 rounded-lg hover:bg-ink-800 dark:hover:bg-white transition-colors disabled:opacity-30"
+                      >
+                        {adding ? (
+                          <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                        ) : "Add"}
+                      </button>
+                    </div>
+                  </>
+                )}
+
                 {addError && <p className="text-xs text-red-500 dark:text-red-400 px-0.5">{addError}</p>}
                 <button
                   onClick={() => setShowAdd(false)}
@@ -1847,15 +2202,28 @@ function App() {
   const [combos, setCombos] = useState<ComboView[]>([]);
   const [activeComboId, setActiveComboId] = useState<string | null>(null);
   const [deviceManagerOpen, setDeviceManagerOpen] = useState(false);
+  const [authPromptOpen, setAuthPromptOpen] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [authChecking, setAuthChecking] = useState(false);
 
-  const api = createApi(activeDeviceId);
+  const api = React.useMemo(() => createApi(activeDeviceId), [activeDeviceId]);
 
   const loadDevices = useCallback(async () => {
     try {
       const [devData, comboData] = await Promise.all([devicesApi.list(), devicesApi.listCombos()]);
       setDevices(devData.devices);
       setCombos(comboData.combos);
-    } catch { /* */ }
+      return true;
+    } catch (err) {
+      if (isAuthError(err)) setAuthPromptOpen(true);
+      return false;
+    }
+  }, []);
+
+  useEffect(() => {
+    devicesApi.authStatus().then((status) => {
+      if (status.required && !getApiToken()) setAuthPromptOpen(true);
+    }).catch(() => { /* */ });
   }, []);
 
   useEffect(() => { loadDevices(); }, [loadDevices]);
@@ -1875,6 +2243,8 @@ function App() {
   });
   const [loading, setLoading] = useState(true);
   const searchTimeoutRef = useRef<NodeJS.Timeout>();
+  const [cameFromUnified, setCameFromUnified] = useState(false);
+  const [cameFromComboId, setCameFromComboId] = useState<string | null>(null);
 
   // Command palette & dialogs
   const [cmdOpen, setCmdOpen] = useState(false);
@@ -1886,6 +2256,26 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const showToast = useCallback((msg: string) => setToast(msg), []);
+  const handleAuthSubmit = useCallback(async (token: string) => {
+    setAuthChecking(true);
+    setAuthError("");
+    setApiToken(token);
+    try {
+      await devicesApi.list();
+      setAuthPromptOpen(false);
+      window.location.reload();
+    } catch (err) {
+      clearApiToken();
+      setAuthError(err instanceof Error ? err.message : "Invalid token");
+      setAuthPromptOpen(true);
+    } finally {
+      setAuthChecking(false);
+    }
+  }, []);
+  const handleAuthClear = useCallback(() => {
+    clearApiToken();
+    setAuthError("");
+  }, []);
 
   // ⌘. dotfiles, ⌘K palette, Delete/Backspace to delete, Enter to rename
   useEffect(() => {
@@ -1977,22 +2367,31 @@ function App() {
         setCurrentPath("");
       } else {
         const data = await api.getFiles(dirPath, hidden ?? showHidden);
-        setFiles(data.files);
+        const activeDevice = devices.find((d) => d.id === activeDeviceId);
+        const tagFiles = cameFromUnified && activeDevice;
+        setFiles(tagFiles ? data.files.map((f) => ({
+          ...f,
+          deviceId: activeDeviceId,
+          deviceName: activeDevice.name,
+          deviceIcon: activeDevice.icon || "💻",
+        })) : data.files);
         setBreadcrumbs(data.breadcrumbs);
         setCurrentPath(dirPath);
       }
     } catch (error) {
+      if (isAuthError(error)) setAuthPromptOpen(true);
       console.error("Failed to load directory:", error);
     } finally {
       setLoading(false);
     }
-  }, [showHidden, api, unifiedMode, activeComboId, combos, devices]);
+  }, [showHidden, api, unifiedMode, activeComboId, combos, devices, cameFromUnified, activeDeviceId]);
 
   const loadRecent = useCallback(async () => {
     try {
       const data = await api.getRecent();
       setRecentFiles(data.files);
     } catch (error) {
+      if (isAuthError(error)) setAuthPromptOpen(true);
       console.error("Failed to load recent files:", error);
     }
   }, [api]);
@@ -2007,7 +2406,17 @@ function App() {
     loadRecent();
   }, [activeDeviceId, showHidden, unifiedMode, activeComboId]);
 
-  // Search (for command palette)
+  // Determine which devices are in the current multi-device view
+  const getViewDevices = useCallback((): Device[] => {
+    if (activeComboId) {
+      const combo = combos.find((c) => c.id === activeComboId);
+      return combo ? devices.filter((d) => combo.deviceIds.includes(d.id) && (d.isLocal || d.enabled)) : [];
+    }
+    if (unifiedMode) return devices.filter((d) => d.isLocal || d.enabled);
+    return [];
+  }, [activeComboId, unifiedMode, combos, devices]);
+
+  // Search (for command palette) — queries all devices in multi-view mode
   useEffect(() => {
     const q = cmdQuery.startsWith(">") ? "" : cmdQuery;
     if (q.length < 2) { setSearchResults([]); setIsSearching(false); return; }
@@ -2015,26 +2424,84 @@ function App() {
     clearTimeout(searchTimeoutRef.current);
     searchTimeoutRef.current = setTimeout(async () => {
       try {
-        const data = await api.search(q, currentPath);
-        setSearchResults(data.results);
+        const isMultiView = (unifiedMode || activeComboId) && !cameFromUnified;
+        if (isMultiView) {
+          const viewDevices = getViewDevices();
+          const allResults = await Promise.allSettled(
+            viewDevices.map(async (d) => {
+              const deviceApi = createApi(d.id);
+              const data = await deviceApi.search(q, "");
+              return data.results.map((f) => ({
+                ...f,
+                deviceId: d.id,
+                deviceName: d.name,
+                deviceIcon: d.icon || "💻",
+              }));
+            })
+          );
+          const merged: FileItem[] = [];
+          for (const r of allResults) {
+            if (r.status === "fulfilled") merged.push(...r.value);
+          }
+          const ql = q.toLowerCase();
+          merged.sort((a, b) => {
+            const aExact = a.name.toLowerCase() === ql ? 1 : 0;
+            const bExact = b.name.toLowerCase() === ql ? 1 : 0;
+            if (aExact !== bExact) return bExact - aExact;
+            const aStarts = a.name.toLowerCase().startsWith(ql) ? 1 : 0;
+            const bStarts = b.name.toLowerCase().startsWith(ql) ? 1 : 0;
+            if (aStarts !== bStarts) return bStarts - aStarts;
+            if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+            return a.name.localeCompare(b.name);
+          });
+          setSearchResults(merged.slice(0, 100));
+        } else {
+          const data = await api.search(q, currentPath);
+          const activeDevice = cameFromUnified ? devices.find((d) => d.id === activeDeviceId) : undefined;
+          setSearchResults(activeDevice ? data.results.map((f) => ({
+            ...f,
+            deviceId: activeDeviceId,
+            deviceName: activeDevice.name,
+            deviceIcon: activeDevice.icon || "💻",
+          })) : data.results);
+        }
       } catch { /* */ }
       finally { setIsSearching(false); }
     }, 200);
-  }, [cmdQuery, currentPath]);
+  }, [cmdQuery, currentPath, unifiedMode, activeComboId, cameFromUnified, activeDeviceId]);
 
-  const [cameFromUnified, setCameFromUnified] = useState(false);
-  const [cameFromComboId, setCameFromComboId] = useState<string | null>(null);
+  // (moved up before loadDirectory)
 
-  // Navigation
-  const handleNavigate = (navPath: string) => {
-    // Handle unified/combo mode device "folders"
-    if (navPath.startsWith("__device__:")) {
-      const deviceId = navPath.replace("__device__:", "");
+  // Switch to a specific device (used by search results in multi-view)
+  const switchToDevice = useCallback((deviceId: string) => {
+    if (deviceId !== activeDeviceId) {
       if (activeComboId) setCameFromComboId(activeComboId);
+      else if (unifiedMode) setCameFromComboId(null);
       setCameFromUnified(true);
       setActiveDeviceId(deviceId);
       setUnifiedMode(false);
       setActiveComboId(null);
+    }
+  }, [activeDeviceId, activeComboId, unifiedMode]);
+
+  // Navigation
+  const handleNavigate = (navPath: string, deviceId?: string) => {
+    // Handle unified/combo mode device "folders"
+    if (navPath.startsWith("__device__:")) {
+      const id = navPath.replace("__device__:", "");
+      if (activeComboId) setCameFromComboId(activeComboId);
+      setCameFromUnified(true);
+      setActiveDeviceId(id);
+      setUnifiedMode(false);
+      setActiveComboId(null);
+      return;
+    }
+    // If search result has a deviceId, switch to that device first
+    if (deviceId && deviceId !== activeDeviceId) {
+      switchToDevice(deviceId);
+      // After switching, navigate to the path (the useEffect will trigger a load of "")
+      // We need to wait for the device switch to apply, so use a small delay
+      setTimeout(() => loadDirectory(navPath), 50);
       return;
     }
     setCmdQuery("");
@@ -2053,8 +2520,11 @@ function App() {
   };
 
   const handleFileClick = (file: FileItem) => {
-    if (file.isDirectory) handleNavigate(file.path);
-    else setSelectedFile(file);
+    if (file.isDirectory) handleNavigate(file.path, file.deviceId);
+    else {
+      if (file.deviceId && file.deviceId !== activeDeviceId) switchToDevice(file.deviceId);
+      setSelectedFile(file);
+    }
   };
 
   const handleFileDoubleClick = (file: FileItem) => {
@@ -2296,12 +2766,28 @@ function App() {
           </div>
         ) : (
           <>
+            {devices.length <= 1 && currentPath === "" && (
+              <section className="mb-6 p-4 rounded-2xl bg-white dark:bg-ink-900 border border-sand-200 dark:border-ink-800">
+                <h2 className="text-sm font-semibold text-ink-900 dark:text-ink-100">Add your first remote machine</h2>
+                <p className="text-xs text-sand-500 dark:text-ink-500 mt-1 leading-relaxed">
+                  1) On remote, run <code className="px-1 py-0.5 bg-sand-100 dark:bg-ink-800 rounded font-mono">PORT=3456 bun server/index.ts</code>
+                  {" "}
+                  2) In device switcher, click <span className="font-medium">Add a Machine</span> and paste tailnet host (port auto-fills to 3456).
+                </p>
+                <button
+                  onClick={() => setDeviceManagerOpen(true)}
+                  className="mt-3 px-3 py-1.5 text-xs font-semibold text-white dark:text-ink-900 bg-ink-900 dark:bg-ink-100 rounded-lg hover:bg-ink-800 dark:hover:bg-white transition-colors"
+                >
+                  Open Device Setup
+                </button>
+              </section>
+            )}
             {currentPath === "" && (
               <FavouritesSection
                 favourites={favs.favourites}
                 onFileClick={(fav) => setSelectedFile({ name: fav.name, path: fav.path, isDirectory: fav.isDirectory, icon: fav.icon, size: 0 })}
                 onNavigate={handleNavigate}
-                onRemove={favs.remove}
+                onRemove={(path, deviceId) => favs.remove(path, deviceId)}
               />
             )}
             {currentPath === "" && <RecentFilesSection files={recentFiles} onFileClick={handleRecentClick} />}
@@ -2343,7 +2829,7 @@ function App() {
                     onDoubleClick={() => handleFileDoubleClick(file)}
                     selected={selectedFile?.path === file.path}
                     viewMode={viewMode}
-                    isFav={favs.isFavourite(file.path)}
+                    isFav={favs.isFavourite(file.path, file.deviceId)}
                     onToggleFav={() => favs.toggle(file)}
                   />
                 ))}
@@ -2362,11 +2848,11 @@ function App() {
           <PreviewPanel
             file={selectedFile}
             onClose={() => setSelectedFile(null)}
-            isFav={selectedFile ? favs.isFavourite(selectedFile.path) : false}
+            isFav={selectedFile ? favs.isFavourite(selectedFile.path, selectedFile.deviceId) : false}
             onToggleFav={() => selectedFile && favs.toggle(selectedFile)}
             onToast={showToast}
             onRefresh={refresh}
-            api={api}
+            api={selectedFile?.deviceId ? createApi(selectedFile.deviceId) : api}
           />
         </>
       )}
@@ -2380,8 +2866,11 @@ function App() {
         onSearchChange={setCmdQuery}
         searchResults={searchResults}
         isSearching={isSearching}
-        onSelectFile={(f) => { f.isDirectory ? handleNavigate(f.path) : setSelectedFile(f); }}
-        onNavigate={handleNavigate}
+        onSelectFile={(f) => {
+          if (f.deviceId && f.deviceId !== activeDeviceId) switchToDevice(f.deviceId);
+          f.isDirectory ? handleNavigate(f.path, f.deviceId) : setSelectedFile(f);
+        }}
+        onNavigate={(p) => handleNavigate(p)}
       />
 
       {/* Dialogs */}
@@ -2411,6 +2900,15 @@ function App() {
         combos={combos}
         onRefresh={loadDevices}
         onToast={showToast}
+      />
+
+      {/* Auth prompt */}
+      <AuthPrompt
+        open={authPromptOpen}
+        loading={authChecking}
+        error={authError}
+        onSubmit={handleAuthSubmit}
+        onClear={handleAuthClear}
       />
 
       {/* Toast */}

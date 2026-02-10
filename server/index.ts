@@ -29,9 +29,12 @@ interface DeviceConfig {
   url: string;        // base URL for HTTP-proxy devices (legacy)
   sshHost?: string;   // SSH host alias (e.g. "macbook", "bens-macbook-air") — preferred
   sshRoot?: string;   // root dir on remote (defaults to $HOME)
+  authToken?: string; // optional token used when talking to this HTTP device
   icon?: string;      // emoji or identifier
   enabled: boolean;
 }
+
+type PublicDeviceConfig = Omit<DeviceConfig, "authToken"> & { hasAuthToken?: boolean };
 
 interface ComboView {
   id: string;
@@ -49,6 +52,11 @@ interface SettingsData {
 const DEVICES_DIR = process.env.FILE_EXPLORER_DATA || path.join(process.env.HOME || "/tmp", ".file-explorer");
 const DEVICES_FILE = path.join(DEVICES_DIR, "devices.json");
 const SETTINGS_FILE = path.join(DEVICES_DIR, "settings.json");
+
+const LEGACY_API_TOKEN = (process.env.FILE_EXPLORER_API_TOKEN || "").trim();
+const ADMIN_API_TOKEN = (process.env.FILE_EXPLORER_ADMIN_TOKEN || LEGACY_API_TOKEN).trim();
+const READ_API_TOKEN = (process.env.FILE_EXPLORER_READ_TOKEN || "").trim();
+const AUTH_ENABLED = Boolean(ADMIN_API_TOKEN || READ_API_TOKEN);
 
 function loadDevices(): DeviceConfig[] {
   try {
@@ -77,6 +85,49 @@ function loadSettings(): SettingsData {
 function saveSettings(settings: SettingsData) {
   fs.mkdirSync(DEVICES_DIR, { recursive: true });
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), "utf-8");
+}
+
+function toPublicDevice(device: DeviceConfig): PublicDeviceConfig {
+  const { authToken, ...rest } = device;
+  return { ...rest, hasAuthToken: Boolean(authToken) };
+}
+
+function normalizeBearer(token: string): string {
+  return token.startsWith("Bearer ") ? token : `Bearer ${token}`;
+}
+
+function getTokenFromRequest(c: any): string | null {
+  const authHeader = (c.req.header("authorization") || "").trim();
+  if (authHeader.toLowerCase().startsWith("bearer ")) {
+    const token = authHeader.slice(7).trim();
+    return token || null;
+  }
+
+  const customHeader = (c.req.header("x-file-explorer-token") || "").trim();
+  if (customHeader) return customHeader;
+
+  const urlToken = (new URL(c.req.url).searchParams.get("token") || "").trim();
+  if (urlToken) return urlToken;
+
+  return null;
+}
+
+function getAuthRole(token: string | null): "admin" | "read" | null {
+  if (!AUTH_ENABLED) return "admin";
+  if (token && ADMIN_API_TOKEN && token === ADMIN_API_TOKEN) return "admin";
+  if (token && READ_API_TOKEN && token === READ_API_TOKEN) return "read";
+  return null;
+}
+
+function getForwardAuthHeader(c: any, explicitToken?: string): string | null {
+  const token = (explicitToken || "").trim();
+  if (token) return normalizeBearer(token);
+
+  const incomingToken = getTokenFromRequest(c);
+  if (incomingToken) return normalizeBearer(incomingToken);
+
+  if (ADMIN_API_TOKEN) return normalizeBearer(ADMIN_API_TOKEN);
+  return null;
 }
 
 // Get hostname for the local device name
@@ -235,6 +286,32 @@ async function sshDownload(host: string, rootDir: string, filePath: string) {
   return data;
 }
 
+// ─── API Auth ────────────────────────────────────────────────────────────────
+
+app.use("/api/*", async (c, next) => {
+  if (c.req.path === "/api/auth/status") return next();
+  if (!AUTH_ENABLED) return next();
+
+  const role = getAuthRole(getTokenFromRequest(c));
+  if (!role) return c.json({ error: "Unauthorized" }, 401);
+
+  const method = c.req.method.toUpperCase();
+  const isWrite = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+  if (isWrite && role !== "admin") {
+    return c.json({ error: "Admin token required for write operations" }, 403);
+  }
+
+  return next();
+});
+
+app.get("/api/auth/status", (c) => {
+  return c.json({
+    required: AUTH_ENABLED,
+    hasReadToken: Boolean(READ_API_TOKEN),
+    writeRequiresAdmin: AUTH_ENABLED,
+  });
+});
+
 // ─── Identity ────────────────────────────────────────────────────────────────
 // Returns this machine's identity so remote instances can register it
 
@@ -263,7 +340,7 @@ app.get("/api/whoami", (c) => {
 // List all devices (including "local")
 app.get("/api/devices", (c) => {
   const devices = loadDevices();
-  const local: DeviceConfig & { isLocal: true } = {
+  const local: PublicDeviceConfig & { isLocal: true } = {
     id: "local",
     name: getLocalName(),
     url: "",
@@ -271,13 +348,13 @@ app.get("/api/devices", (c) => {
     enabled: true,
     isLocal: true,
   };
-  return c.json({ devices: [local, ...devices] });
+  return c.json({ devices: [local, ...devices.map(toPublicDevice)] });
 });
 
 // Add a device (SSH or HTTP)
 app.post("/api/devices", async (c) => {
   const body = await c.req.json();
-  const { name, url, icon, sshHost, sshRoot } = body;
+  const { name, url, icon, sshHost, sshRoot, authToken } = body;
 
   // SSH device — just needs sshHost
   if (sshHost) {
@@ -302,7 +379,7 @@ app.post("/api/devices", async (c) => {
     };
     devices.push(device);
     saveDevices(devices);
-    return c.json({ success: true, device });
+    return c.json({ success: true, device: toPublicDevice(device) });
   }
 
   // HTTP device (legacy) — needs name + url
@@ -318,18 +395,30 @@ app.post("/api/devices", async (c) => {
   // Validate connectivity
   try {
     const cleanUrl = url.replace(/\/+$/, "");
+    const cleanToken = typeof authToken === "string" ? authToken.trim() : "";
+    const authHeader = getForwardAuthHeader(c, cleanToken);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
-    const probe = await fetch(`${cleanUrl}/api/files?path=`, { signal: controller.signal }).finally(() => clearTimeout(timeout));
+    const probe = await fetch(`${cleanUrl}/api/files?path=`, {
+      signal: controller.signal,
+      headers: authHeader ? { Authorization: authHeader } : undefined,
+    }).finally(() => clearTimeout(timeout));
     if (!probe.ok) return c.json({ error: `Remote returned ${probe.status}` }, 502);
   } catch (err: any) {
     return c.json({ error: `Cannot reach ${url}: ${err.message || "timeout"}` }, 502);
   }
 
-  const device: DeviceConfig = { id, name, url: url.replace(/\/+$/, ""), icon: icon || "🖥️", enabled: true };
+  const device: DeviceConfig = {
+    id,
+    name,
+    url: url.replace(/\/+$/, ""),
+    authToken: typeof authToken === "string" && authToken.trim() ? authToken.trim() : undefined,
+    icon: icon || "🖥️",
+    enabled: true,
+  };
   devices.push(device);
   saveDevices(devices);
-  return c.json({ success: true, device });
+  return c.json({ success: true, device: toPublicDevice(device) });
 });
 
 // Update a device
@@ -343,10 +432,15 @@ app.put("/api/devices/:id", async (c) => {
   const body = await c.req.json();
   if (body.name !== undefined) devices[idx].name = body.name;
   if (body.url !== undefined) devices[idx].url = body.url.replace(/\/+$/, "");
+  if (body.authToken !== undefined) {
+    devices[idx].authToken = typeof body.authToken === "string" && body.authToken.trim()
+      ? body.authToken.trim()
+      : undefined;
+  }
   if (body.icon !== undefined) devices[idx].icon = body.icon;
   if (body.enabled !== undefined) devices[idx].enabled = body.enabled;
   saveDevices(devices);
-  return c.json({ success: true, device: devices[idx] });
+  return c.json({ success: true, device: toPublicDevice(devices[idx]) });
 });
 
 // Delete a device
@@ -383,7 +477,11 @@ app.get("/api/devices/:id/health", async (c) => {
 
   // HTTP device
   try {
-    const res = await fetch(`${device.url}/api/files?path=`, { signal: AbortSignal.timeout(5000) });
+    const authHeader = getForwardAuthHeader(c, device.authToken);
+    const res = await fetch(`${device.url}/api/files?path=`, {
+      signal: AbortSignal.timeout(5000),
+      headers: authHeader ? { Authorization: authHeader } : undefined,
+    });
     const latency = Date.now() - start;
     return c.json({ status: res.ok ? "ok" : "error", latency, httpStatus: res.status });
   } catch (err: any) {
@@ -612,6 +710,8 @@ app.all("/api/d/:deviceId/*", async (c) => {
   try {
     const proxyHeaders = new Headers(c.req.raw.headers);
     proxyHeaders.delete("host");
+    const authHeader = getForwardAuthHeader(c, device.authToken);
+    if (authHeader) proxyHeaders.set("authorization", authHeader);
 
     const proxyController = new AbortController();
     const proxyTimeout = setTimeout(() => proxyController.abort(), 30000);
