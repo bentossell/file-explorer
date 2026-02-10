@@ -220,7 +220,17 @@ async function sshListFiles(host: string, rootDir: string, requestedPath: string
 }
 
 async function sshSearch(host: string, rootDir: string, searchPath: string, query: string) {
-  const targetDir = searchPath ? `${rootDir}/${searchPath}` : rootDir;
+  // If query contains "/" treat prefix as directory context
+  let effectivePath = searchPath;
+  let effectiveQuery = query;
+  if (query.includes("/")) {
+    const lastSlash = query.lastIndexOf("/");
+    const dirPart = query.slice(0, lastSlash);
+    effectivePath = searchPath ? `${searchPath}/${dirPart}` : dirPart;
+    effectiveQuery = query.slice(lastSlash + 1) || "";
+  }
+
+  const targetDir = effectivePath ? `${rootDir}/${effectivePath}` : rootDir;
   const cmd = `find ${JSON.stringify(targetDir)} -maxdepth 5 -name '*' 2>/dev/null | head -500`;
   const { stdout } = await sshExec(host, cmd);
   const allPaths = stdout.trim().split("\n").filter(Boolean);
@@ -230,8 +240,12 @@ async function sshSearch(host: string, rootDir: string, searchPath: string, quer
     return { name, path: relativePath, isDirectory: false, icon: getFileType(name), size: 0 };
   }).filter((f) => f.name && !f.name.startsWith("."));
 
-  const fuse = new Fuse(items, { keys: ["name"], threshold: 0.4, includeScore: true });
-  return { results: fuse.search(query).slice(0, 50).map((r) => r.item) };
+  if (query.includes("/") && !effectiveQuery) {
+    return { results: items.slice(0, 50) };
+  }
+
+  const fuse = new Fuse(items, { keys: ["name", "path"], threshold: 0.4, includeScore: true });
+  return { results: fuse.search(effectiveQuery || query).slice(0, 50).map((r) => r.item) };
 }
 
 async function sshPreview(host: string, rootDir: string, filePath: string) {
@@ -841,7 +855,22 @@ app.get("/api/search", async (c) => {
     return c.json({ results: [] });
   }
 
-  const safePath = resolveSafePath(searchPath);
+  // If query contains "/" treat prefix as directory context
+  let effectivePath = searchPath;
+  let effectiveQuery = query;
+  if (query.includes("/")) {
+    const lastSlash = query.lastIndexOf("/");
+    const dirPart = query.slice(0, lastSlash);
+    const namePart = query.slice(lastSlash + 1);
+    const combined = searchPath ? `${searchPath}/${dirPart}` : dirPart;
+    const testPath = resolveSafePath(combined);
+    if (testPath && fs.existsSync(testPath) && fs.statSync(testPath).isDirectory()) {
+      effectivePath = combined;
+      effectiveQuery = namePart || "";
+    }
+  }
+
+  const safePath = resolveSafePath(effectivePath);
   if (!safePath) {
     return c.json({ error: "Invalid path" }, 400);
   }
@@ -885,14 +914,19 @@ app.get("/api/search", async (c) => {
 
   searchDir(safePath, 0);
 
-  // Fuzzy search with Fuse.js
+  // If path query with empty tail, return directory listing directly
+  if (query.includes("/") && !effectiveQuery) {
+    return c.json({ results: results.slice(0, 50) });
+  }
+
+  // Fuzzy search with Fuse.js — match on both name and path
   const fuse = new Fuse(results, {
-    keys: ["name"],
+    keys: ["name", "path"],
     threshold: 0.4,
     includeScore: true,
   });
 
-  const searchResults = fuse.search(query).slice(0, 50).map(r => r.item);
+  const searchResults = fuse.search(effectiveQuery || query).slice(0, 50).map(r => r.item);
 
   return c.json({ results: searchResults });
 });
