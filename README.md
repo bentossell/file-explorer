@@ -1,6 +1,7 @@
 # File Explorer
 
 Self-hosted multi-machine file browser.
+built with [droid](https://factory.ai)
 
 ## Model
 
