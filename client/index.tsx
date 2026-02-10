@@ -76,6 +76,7 @@ interface ComboView {
 interface Settings {
   localName?: string;
   localIcon?: string;
+  defaultSearchScope?: string;  // device ID, combo ID, or "all"
   comboViews: ComboView[];
 }
 
@@ -607,6 +608,12 @@ interface CommandItem {
   onSelect: () => void;
 }
 
+interface SearchScope {
+  id: string;    // device ID, combo ID, or "all"
+  label: string;
+  icon?: string;
+}
+
 function CommandPalette({
   open,
   onClose,
@@ -617,6 +624,11 @@ function CommandPalette({
   isSearching,
   onSelectFile,
   onNavigate,
+  searchScope,
+  searchScopes,
+  onSearchScopeChange,
+  onSetDefaultScope,
+  defaultScope,
 }: {
   open: boolean;
   onClose: () => void;
@@ -627,6 +639,11 @@ function CommandPalette({
   isSearching: boolean;
   onSelectFile: (f: FileItem) => void;
   onNavigate: (p: string) => void;
+  searchScope: string;
+  searchScopes: SearchScope[];
+  onSearchScopeChange: (id: string) => void;
+  onSetDefaultScope: (id: string) => void;
+  defaultScope: string;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [selectedIdx, setSelectedIdx] = useState(0);
@@ -658,7 +675,16 @@ function CommandPalette({
     el?.scrollIntoView({ block: "nearest" });
   }, [selectedIdx]);
 
+  const currentScope = searchScopes.find((s) => s.id === searchScope);
+
   const handleKey = (e: React.KeyboardEvent) => {
+    if (e.key === "Tab" && e.shiftKey) {
+      e.preventDefault();
+      const idx = searchScopes.findIndex((s) => s.id === searchScope);
+      const next = searchScopes[(idx + 1) % searchScopes.length];
+      if (next) onSearchScopeChange(next.id);
+      return;
+    }
     if (e.key === "ArrowDown") { e.preventDefault(); setSelectedIdx((i) => Math.min(i + 1, totalItems - 1)); }
     else if (e.key === "ArrowUp") { e.preventDefault(); setSelectedIdx((i) => Math.max(i - 1, 0)); }
     else if (e.key === "Enter" && totalItems > 0) {
@@ -701,6 +727,42 @@ function CommandPalette({
               esc
             </kbd>
           </div>
+
+          {/* Search scope bar */}
+          {searchScopes.length > 1 && (
+            <div className="flex items-center gap-1.5 px-4 py-1.5 border-b border-sand-100 dark:border-ink-800 bg-sand-50/50 dark:bg-ink-900/50">
+              <span className="text-[10px] text-sand-400 dark:text-ink-600 mr-1">Searching:</span>
+              {searchScopes.map((s) => (
+                <button
+                  key={s.id}
+                  onClick={() => onSearchScopeChange(s.id)}
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium transition-colors ${
+                    s.id === searchScope
+                      ? "bg-sand-200 dark:bg-ink-700 text-ink-800 dark:text-ink-200"
+                      : "text-sand-400 dark:text-ink-500 hover:text-ink-600 dark:hover:text-ink-300 hover:bg-sand-100 dark:hover:bg-ink-800"
+                  }`}
+                >
+                  {s.icon && <span className="text-[10px]">{s.icon}</span>}
+                  <span>{s.label}</span>
+                </button>
+              ))}
+              <div className="flex-1" />
+              <button
+                onClick={() => onSetDefaultScope(searchScope)}
+                className={`text-[10px] transition-colors ${
+                  defaultScope === searchScope
+                    ? "text-sand-400 dark:text-ink-600"
+                    : "text-sand-300 dark:text-ink-600 hover:text-ink-500 dark:hover:text-ink-400"
+                }`}
+                title={defaultScope === searchScope ? "This is the default" : "Set as default search scope"}
+              >
+                {defaultScope === searchScope ? "★ default" : "☆ set default"}
+              </button>
+              <kbd className="hidden sm:inline-flex px-1 py-0.5 text-[9px] font-mono text-sand-400 dark:text-ink-600 bg-sand-100 dark:bg-ink-800 rounded border border-sand-200/50 dark:border-ink-700/50">
+                ⇧Tab
+              </kbd>
+            </div>
+          )}
 
           {/* Results */}
           <div ref={listRef} className="max-h-[50vh] overflow-auto py-1">
@@ -2210,9 +2272,17 @@ function App() {
 
   const loadDevices = useCallback(async () => {
     try {
-      const [devData, comboData] = await Promise.all([devicesApi.list(), devicesApi.listCombos()]);
+      const [devData, comboData, settingsData] = await Promise.all([
+        devicesApi.list(),
+        devicesApi.listCombos(),
+        devicesApi.getSettings(),
+      ]);
       setDevices(devData.devices);
       setCombos(comboData.combos);
+      if (settingsData.defaultSearchScope) {
+        setDefaultSearchScope(settingsData.defaultSearchScope);
+        setSearchScope(settingsData.defaultSearchScope);
+      }
       return true;
     } catch (err) {
       if (isAuthError(err)) setAuthPromptOpen(true);
@@ -2244,6 +2314,8 @@ function App() {
   const [loading, setLoading] = useState(true);
   const searchTimeoutRef = useRef<NodeJS.Timeout>();
   const [cameFromUnified, setCameFromUnified] = useState(false);
+  const [searchScope, setSearchScope] = useState<string>("current");
+  const [defaultSearchScope, setDefaultSearchScope] = useState<string>("current");
   const [cameFromComboId, setCameFromComboId] = useState<string | null>(null);
 
   // Command palette & dialogs
@@ -2277,7 +2349,7 @@ function App() {
     setAuthError("");
   }, []);
 
-  // ⌘. dotfiles, ⌘K palette, Delete/Backspace to delete, Enter to rename
+  // ⌘⇧. dotfiles, ⌘K palette, Delete/Backspace to delete, Enter to rename
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       // Don't capture if typing in input/textarea
@@ -2288,8 +2360,9 @@ function App() {
         e.preventDefault();
         setCmdOpen(true);
         setCmdQuery("");
+        setSearchScope(defaultSearchScope);
       }
-      if ((e.metaKey || e.ctrlKey) && e.key === ".") {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === ">") {
         e.preventDefault();
         setShowHidden((prev) => { const next = !prev; localStorage.setItem("showHidden", String(next)); return next; });
       }
@@ -2416,7 +2489,23 @@ function App() {
     return [];
   }, [activeComboId, unifiedMode, combos, devices]);
 
-  // Search (for command palette) — queries all devices in multi-view mode
+  // Build search scopes list
+  const searchScopes = React.useMemo((): SearchScope[] => {
+    const scopes: SearchScope[] = [{ id: "current", label: "Current", icon: "📂" }];
+    if (devices.length > 1) scopes.push({ id: "all", label: "All Devices", icon: "🌐" });
+    for (const combo of combos) scopes.push({ id: `combo:${combo.id}`, label: combo.name, icon: combo.icon });
+    for (const d of devices) {
+      if (d.isLocal || d.enabled) scopes.push({ id: d.id, label: d.name, icon: d.icon || "💻" });
+    }
+    return scopes;
+  }, [devices, combos]);
+
+  const handleSetDefaultScope = useCallback(async (scopeId: string) => {
+    setDefaultSearchScope(scopeId);
+    try { await devicesApi.updateSettings({ defaultSearchScope: scopeId } as any); } catch { /* */ }
+  }, []);
+
+  // Search (for command palette) — scope-aware
   useEffect(() => {
     const q = cmdQuery.startsWith(">") ? "" : cmdQuery;
     if (q.length < 2) { setSearchResults([]); setIsSearching(false); return; }
@@ -2424,11 +2513,41 @@ function App() {
     clearTimeout(searchTimeoutRef.current);
     searchTimeoutRef.current = setTimeout(async () => {
       try {
-        const isMultiView = (unifiedMode || activeComboId) && !cameFromUnified;
-        if (isMultiView) {
-          const viewDevices = getViewDevices();
+        // Determine which devices to search based on scope
+        let targetDevices: Device[] = [];
+        const scope = searchScope;
+
+        if (scope === "current") {
+          // Old behavior: search active device with current path context
+          const isMultiView = (unifiedMode || activeComboId) && !cameFromUnified;
+          if (isMultiView) {
+            targetDevices = getViewDevices();
+          } else {
+            const data = await api.search(q, currentPath);
+            const activeDevice = cameFromUnified ? devices.find((d) => d.id === activeDeviceId) : undefined;
+            setSearchResults(activeDevice ? data.results.map((f) => ({
+              ...f,
+              deviceId: activeDeviceId,
+              deviceName: activeDevice.name,
+              deviceIcon: activeDevice.icon || "💻",
+            })) : data.results);
+            return;
+          }
+        } else if (scope === "all") {
+          targetDevices = devices.filter((d) => d.isLocal || d.enabled);
+        } else if (scope.startsWith("combo:")) {
+          const comboId = scope.replace("combo:", "");
+          const combo = combos.find((c) => c.id === comboId);
+          targetDevices = combo ? devices.filter((d) => combo.deviceIds.includes(d.id) && (d.isLocal || d.enabled)) : [];
+        } else {
+          // Single device by ID
+          const d = devices.find((d) => d.id === scope);
+          if (d) targetDevices = [d];
+        }
+
+        if (targetDevices.length > 0) {
           const allResults = await Promise.allSettled(
-            viewDevices.map(async (d) => {
+            targetDevices.map(async (d) => {
               const deviceApi = createApi(d.id);
               const data = await deviceApi.search(q, "");
               return data.results.map((f) => ({
@@ -2455,20 +2574,11 @@ function App() {
             return a.name.localeCompare(b.name);
           });
           setSearchResults(merged.slice(0, 100));
-        } else {
-          const data = await api.search(q, currentPath);
-          const activeDevice = cameFromUnified ? devices.find((d) => d.id === activeDeviceId) : undefined;
-          setSearchResults(activeDevice ? data.results.map((f) => ({
-            ...f,
-            deviceId: activeDeviceId,
-            deviceName: activeDevice.name,
-            deviceIcon: activeDevice.icon || "💻",
-          })) : data.results);
         }
       } catch { /* */ }
       finally { setIsSearching(false); }
     }, 200);
-  }, [cmdQuery, currentPath, unifiedMode, activeComboId, cameFromUnified, activeDeviceId]);
+  }, [cmdQuery, currentPath, unifiedMode, activeComboId, cameFromUnified, activeDeviceId, searchScope]);
 
   // (moved up before loadDirectory)
 
@@ -2632,7 +2742,7 @@ function App() {
       { id: "duplicate", label: `Duplicate "${selectedFile.name}"`, icon: Icons.duplicate, shortcut: "⌘D", section: "action" as const, onSelect: () => handleDuplicate(selectedFile!) },
       { id: "delete", label: `Delete "${selectedFile.name}"`, icon: Icons.trash, shortcut: "⌫", section: "action" as const, onSelect: () => promptDelete(selectedFile!) },
     ] : []),
-    { id: "toggle-hidden", label: showHidden ? "Hide Dotfiles" : "Show Dotfiles", icon: showHidden ? Icons.eyeOff : Icons.eye, shortcut: "⌘.", section: "action", onSelect: () => setShowHidden((p) => { const n = !p; localStorage.setItem("showHidden", String(n)); return n; }) },
+    { id: "toggle-hidden", label: showHidden ? "Hide Dotfiles" : "Show Dotfiles", icon: showHidden ? Icons.eyeOff : Icons.eye, shortcut: "⌘⇧.", section: "action", onSelect: () => setShowHidden((p) => { const n = !p; localStorage.setItem("showHidden", String(n)); return n; }) },
     { id: "toggle-view", label: viewMode === "list" ? "Grid View" : "List View", icon: viewMode === "list" ? Icons.grid : Icons.list, section: "action", onSelect: () => setViewMode((v) => v === "list" ? "grid" : "list") },
     { id: "toggle-theme", label: theme.dark ? "Light Mode" : "Dark Mode", icon: theme.dark ? Icons.sun : Icons.moon, section: "action", onSelect: theme.toggle },
     { id: "manage-devices", label: "Manage Devices…", icon: Icons.settings, section: "action", onSelect: () => setDeviceManagerOpen(true) },
@@ -2728,7 +2838,7 @@ function App() {
             <button
               onClick={() => setShowHidden((prev) => { const next = !prev; localStorage.setItem("showHidden", String(next)); return next; })}
               className={`p-2 rounded-xl transition-all ${showHidden ? "bg-sand-200 dark:bg-ink-700 text-ink-700 dark:text-ink-200" : "text-sand-400 dark:text-ink-500 hover:text-ink-700 dark:hover:text-ink-200 hover:bg-sand-100 dark:hover:bg-ink-800"}`}
-              title={`${showHidden ? "Hide" : "Show"} dotfiles (⌘.)`}
+              title={`${showHidden ? "Hide" : "Show"} dotfiles (⌘⇧.)`}
             >
               {showHidden ? Icons.eye : Icons.eyeOff}
             </button>
@@ -2741,7 +2851,7 @@ function App() {
 
           {/* Search trigger (opens command palette) */}
           <button
-            onClick={() => { setCmdOpen(true); setCmdQuery(""); }}
+            onClick={() => { setCmdOpen(true); setCmdQuery(""); setSearchScope(defaultSearchScope); }}
             className="w-full flex items-center gap-3 bg-white dark:bg-ink-900 border border-sand-200 dark:border-ink-800 rounded-xl px-3.5 py-2.5 text-sm text-sand-400 dark:text-ink-500 hover:border-sand-300 dark:hover:border-ink-700 transition-all group"
           >
             <span className="text-sand-400 dark:text-ink-500 group-hover:text-sand-600 dark:group-hover:text-ink-300 transition-colors">{Icons.search}</span>
@@ -2871,6 +2981,11 @@ function App() {
           f.isDirectory ? handleNavigate(f.path, f.deviceId) : setSelectedFile(f);
         }}
         onNavigate={(p) => handleNavigate(p)}
+        searchScope={searchScope}
+        searchScopes={searchScopes}
+        onSearchScopeChange={setSearchScope}
+        onSetDefaultScope={handleSetDefaultScope}
+        defaultScope={defaultSearchScope}
       />
 
       {/* Dialogs */}

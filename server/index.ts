@@ -46,6 +46,7 @@ interface ComboView {
 interface SettingsData {
   localName?: string;    // custom name for local device
   localIcon?: string;    // custom icon for local device
+  defaultSearchScope?: string;  // device ID, combo ID, or "all" — default search scope for command palette
   comboViews: ComboView[];
 }
 
@@ -517,6 +518,7 @@ app.put("/api/settings", async (c) => {
   const settings = loadSettings();
   if (body.localName !== undefined) settings.localName = body.localName || undefined;
   if (body.localIcon !== undefined) settings.localIcon = body.localIcon || undefined;
+  if (body.defaultSearchScope !== undefined) settings.defaultSearchScope = body.defaultSearchScope || undefined;
   saveSettings(settings);
   return c.json({ success: true, settings });
 });
